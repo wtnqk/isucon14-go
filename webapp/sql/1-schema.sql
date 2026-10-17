@@ -134,3 +134,14 @@ CREATE TABLE coupons
   PRIMARY KEY (user_id, code)
 )
   COMMENT 'クーポンテーブル';
+
+-- インデックス（POST /api/initialize でテーブルごと作り直されるので、ここに書く）
+ALTER TABLE chairs ADD INDEX idx_access_token (access_token);
+ALTER TABLE chair_locations ADD INDEX idx_chair_id_created_at (chair_id, created_at DESC);
+ALTER TABLE rides ADD INDEX idx_chair_id_updated_at (chair_id, updated_at DESC);
+ALTER TABLE rides ADD INDEX idx_chair_id_created_at (chair_id, created_at DESC);
+ALTER TABLE rides ADD INDEX idx_user_id_created_at (user_id, created_at DESC);
+ALTER TABLE ride_statuses ADD INDEX idx_ride_id_created_at (ride_id, created_at DESC);
+ALTER TABLE ride_statuses ADD INDEX idx_ride_id_app_sent_at (ride_id, app_sent_at, created_at);
+ALTER TABLE ride_statuses ADD INDEX idx_ride_id_chair_sent_at (ride_id, chair_sent_at, created_at);
+ALTER TABLE coupons ADD INDEX idx_used_by (used_by);
