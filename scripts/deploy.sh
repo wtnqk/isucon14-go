@@ -30,6 +30,14 @@ APP_BIN="${APP_BIN:-isuride}"
 # 認証なしで叩いて 401 が返れば生きている。POST /api/initialize は DB を初期化するので使わない。
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:8080/api/app/notification}"
 
+# ssh は引数をつなげて1つのコマンド文字列としてサーバーのシェルに渡す。
+# スペースを含む値（コミットメッセージなど）が分割されないよう、引用符で囲んでから渡す。
+remote_bash() {
+    local host="$1"
+    shift
+    ssh "$host" "bash -s -- $(printf '%q ' "$@")"
+}
+
 usage() {
     sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 1
@@ -92,7 +100,7 @@ for h in "${hosts[@]}"; do
 
     if [ $build_only -eq 1 ]; then
         echo "==> [$host] ビルドのみ"
-        ssh "$host" bash -s -- "$REMOTE_STAGE" "$REMOTE_OVERLAY" "$REMOTE_GO" "$APP_BIN" <<'REMOTE'
+        remote_bash "$host" "$REMOTE_STAGE" "$REMOTE_OVERLAY" "$REMOTE_GO" "$APP_BIN" <<'REMOTE'
 set -euo pipefail
 stage=$1 overlay=$2 go=$3 bin=$4
 if [ -d "$overlay" ] && [ -n "$(ls -A "$overlay")" ]; then
@@ -107,7 +115,7 @@ REMOTE
     fi
 
     echo "==> [$host] ビルド → 反映 → 再起動"
-    ssh "$host" bash -s -- \
+    remote_bash "$host" \
         "$REMOTE_STAGE" "$REMOTE_ROOT" "$REMOTE_GO" "$APP_BIN" "$APP_SERVICE" "$HEALTH_URL" \
         "$short" "$subject" "$deployer" "$DEPLOY_PATHS" "$REMOTE_OVERLAY" <<'REMOTE'
 set -euo pipefail
