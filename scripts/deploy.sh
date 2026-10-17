@@ -85,7 +85,7 @@ for h in "${hosts[@]}"; do
     if [ $build_only -eq 1 ]; then
         # 作業ツリーをそのまま送る（未コミットの変更も含む。追跡していないファイルも含めるため tar を使う）
         # macOS の tar が付ける ._ ファイルと拡張属性は、Linux 側で邪魔になるので付けない
-        COPYFILE_DISABLE=1 tar --no-xattrs --exclude="$APP_BIN" -cf - $DEPLOY_PATHS
+        COPYFILE_DISABLE=1 tar --no-xattrs --no-fflags --exclude="$APP_BIN" -cf - $DEPLOY_PATHS
     else
         git archive --format=tar "$commit" $DEPLOY_PATHS
     fi | ssh "$host" "set -e; rm -rf '$REMOTE_STAGE'; mkdir -p '$REMOTE_STAGE'; tar -xf - -C '$REMOTE_STAGE'"
@@ -151,4 +151,8 @@ REMOTE
 done
 
 echo ""
-echo "==> 完了: $short を ${hosts[*]} へ"
+if [ $build_only -eq 1 ]; then
+    echo "==> 完了: ${hosts[*]} でビルドを確認（反映はしていない）"
+else
+    echo "==> 完了: $short を ${hosts[*]} へ"
+fi
