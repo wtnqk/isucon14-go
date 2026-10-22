@@ -145,3 +145,6 @@ ALTER TABLE ride_statuses ADD INDEX idx_ride_id_created_at (ride_id, created_at 
 ALTER TABLE ride_statuses ADD INDEX idx_ride_id_app_sent_at (ride_id, app_sent_at, created_at);
 ALTER TABLE ride_statuses ADD INDEX idx_ride_id_chair_sent_at (ride_id, chair_sent_at, created_at);
 ALTER TABLE coupons ADD INDEX idx_used_by (used_by);
+-- 招待コードからのクーポン検索（WHERE code = ? FOR UPDATE）が全表走査になると、
+-- 行ロックではなくテーブル全体をロックしてしまうため、code 単独でも引けるようにする
+ALTER TABLE coupons ADD INDEX idx_code (code);

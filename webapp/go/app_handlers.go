@@ -72,8 +72,10 @@ func appPostUsers(w http.ResponseWriter, r *http.Request) {
 	// 招待コードを使った登録
 	if req.InvitationCode != nil && *req.InvitationCode != "" {
 		// 招待する側の招待数をチェック
+		// code だけで引くため idx_code を使う。インデックスが無いと全表走査になり、
+		// FOR UPDATE でテーブル全体をロックしてしまう。
 		var coupons []Coupon
-		err = tx.SelectContext(ctx, &coupons, "SELECT * FROM coupons WHERE code = ? FOR UPDATE", "INV_"+*req.InvitationCode)
+		err = tx.SelectContext(ctx, &coupons, "SELECT * FROM coupons FORCE INDEX (idx_code) WHERE code = ? FOR UPDATE", "INV_"+*req.InvitationCode)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -362,16 +364,19 @@ func appPostRides(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var coupon Coupon
+	// クーポンの行ロックは PRIMARY (user_id, code) に寄せる。
+	// used_by IS NULL の条件で idx_used_by が選ばれると、appPostUsers の招待クーポン INSERT
+	// （PRIMARY → idx_used_by の順にロック）とロック順序が食い違い、デッドロックになる。
 	if rideCount == 1 {
 		// 初回利用で、初回利用クーポンがあれば必ず使う
-		if err := tx.GetContext(ctx, &coupon, "SELECT * FROM coupons WHERE user_id = ? AND code = 'CP_NEW2024' AND used_by IS NULL FOR UPDATE", user.ID); err != nil {
+		if err := tx.GetContext(ctx, &coupon, "SELECT * FROM coupons FORCE INDEX (PRIMARY) WHERE user_id = ? AND code = 'CP_NEW2024' AND used_by IS NULL FOR UPDATE", user.ID); err != nil {
 			if !errors.Is(err, sql.ErrNoRows) {
 				writeError(w, http.StatusInternalServerError, err)
 				return
 			}
 
 			// 無ければ他のクーポンを付与された順番に使う
-			if err := tx.GetContext(ctx, &coupon, "SELECT * FROM coupons WHERE user_id = ? AND used_by IS NULL ORDER BY created_at LIMIT 1 FOR UPDATE", user.ID); err != nil {
+			if err := tx.GetContext(ctx, &coupon, "SELECT * FROM coupons FORCE INDEX (PRIMARY) WHERE user_id = ? AND used_by IS NULL ORDER BY created_at LIMIT 1 FOR UPDATE", user.ID); err != nil {
 				if !errors.Is(err, sql.ErrNoRows) {
 					writeError(w, http.StatusInternalServerError, err)
 					return
@@ -398,7 +403,7 @@ func appPostRides(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		// 他のクーポンを付与された順番に使う
-		if err := tx.GetContext(ctx, &coupon, "SELECT * FROM coupons WHERE user_id = ? AND used_by IS NULL ORDER BY created_at LIMIT 1 FOR UPDATE", user.ID); err != nil {
+		if err := tx.GetContext(ctx, &coupon, "SELECT * FROM coupons FORCE INDEX (PRIMARY) WHERE user_id = ? AND used_by IS NULL ORDER BY created_at LIMIT 1 FOR UPDATE", user.ID); err != nil {
 			if !errors.Is(err, sql.ErrNoRows) {
 				writeError(w, http.StatusInternalServerError, err)
 				return
