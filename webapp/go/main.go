@@ -75,6 +75,7 @@ func setup() http.Handler {
 		mux.HandleFunc("POST /api/app/users", appPostUsers)
 
 		authedMux := mux.With(appAuthMiddleware)
+		// app1
 		authedMux.HandleFunc("POST /api/app/payment-methods", appPostPaymentMethods)
 		authedMux.HandleFunc("GET /api/app/rides", appGetRides)
 		authedMux.HandleFunc("POST /api/app/rides", appPostRides)
@@ -89,6 +90,7 @@ func setup() http.Handler {
 		mux.HandleFunc("POST /api/owner/owners", ownerPostOwners)
 
 		authedMux := mux.With(ownerAuthMiddleware)
+		// app2
 		authedMux.HandleFunc("GET /api/owner/sales", ownerGetSales)
 		authedMux.HandleFunc("GET /api/owner/chairs", ownerGetChairs)
 	}
