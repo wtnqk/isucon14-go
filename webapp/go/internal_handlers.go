@@ -82,7 +82,8 @@ SELECT c.id,
  LIMIT 1`
 
 	var row struct {
-		ID string `db:"id"`
+		ID       string `db:"id"`
+		Distance int    `db:"distance"`
 	}
 	if err := db.GetContext(ctx, &row, query, pickupLatitude, pickupLongitude); err != nil {
 		return "", err
