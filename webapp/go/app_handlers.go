@@ -763,57 +763,31 @@ func appGetNotification(w http.ResponseWriter, r *http.Request) {
 func getChairStats(ctx context.Context, tx *sqlx.Tx, chairID string) (appGetNotificationResponseChairStats, error) {
 	stats := appGetNotificationResponseChairStats{}
 
-	rides := []Ride{}
-	err := tx.SelectContext(
+	// 旧実装は椅子のライドを全件取り、ライドごとにステータスを全件読んでいた（O(ライド数) のクエリ）。
+	// ARRIVED / CARRYING / COMPLETED の3つが揃っているライドだけが集計対象なので、EXISTS で同じ条件を1クエリで判定する。
+	// 平均は旧実装と同じく「合計 / 件数」を Go 側で計算し、AVG() の丸め差を避ける。
+	var row struct {
+		TotalRidesCount    int   `db:"total_rides_count"`
+		TotalEvaluationSum int64 `db:"total_evaluation_sum"`
+	}
+	if err := tx.GetContext(
 		ctx,
-		&rides,
-		`SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC`,
+		&row,
+		`SELECT COUNT(*)                        AS total_rides_count,
+		        IFNULL(SUM(rides.evaluation), 0) AS total_evaluation_sum
+		   FROM rides
+		  WHERE rides.chair_id = ?
+		    AND EXISTS (SELECT 1 FROM ride_statuses WHERE ride_statuses.ride_id = rides.id AND ride_statuses.status = 'ARRIVED')
+		    AND EXISTS (SELECT 1 FROM ride_statuses WHERE ride_statuses.ride_id = rides.id AND ride_statuses.status = 'CARRYING')
+		    AND EXISTS (SELECT 1 FROM ride_statuses WHERE ride_statuses.ride_id = rides.id AND ride_statuses.status = 'COMPLETED')`,
 		chairID,
-	)
-	if err != nil {
+	); err != nil {
 		return stats, err
 	}
 
-	totalRideCount := 0
-	totalEvaluation := 0.0
-	for _, ride := range rides {
-		rideStatuses := []RideStatus{}
-		err = tx.SelectContext(
-			ctx,
-			&rideStatuses,
-			`SELECT * FROM ride_statuses WHERE ride_id = ? ORDER BY created_at`,
-			ride.ID,
-		)
-		if err != nil {
-			return stats, err
-		}
-
-		var arrivedAt, pickupedAt *time.Time
-		var isCompleted bool
-		for _, status := range rideStatuses {
-			if status.Status == "ARRIVED" {
-				arrivedAt = &status.CreatedAt
-			} else if status.Status == "CARRYING" {
-				pickupedAt = &status.CreatedAt
-			}
-			if status.Status == "COMPLETED" {
-				isCompleted = true
-			}
-		}
-		if arrivedAt == nil || pickupedAt == nil {
-			continue
-		}
-		if !isCompleted {
-			continue
-		}
-
-		totalRideCount++
-		totalEvaluation += float64(*ride.Evaluation)
-	}
-
-	stats.TotalRidesCount = totalRideCount
-	if totalRideCount > 0 {
-		stats.TotalEvaluationAvg = totalEvaluation / float64(totalRideCount)
+	stats.TotalRidesCount = row.TotalRidesCount
+	if row.TotalRidesCount > 0 {
+		stats.TotalEvaluationAvg = float64(row.TotalEvaluationSum) / float64(row.TotalRidesCount)
 	}
 
 	return stats, nil

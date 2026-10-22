@@ -1,8 +1,8 @@
 [Unit]
 Description=isuride-go
-After=syslog.target
-After=mysql.service
-Requires=mysql.service
+After=syslog.target network-online.target
+Wants=network-online.target
+# DB を別ホストに置く構成のため、mysql.service への依存は持たない
 
 [Service]
 WorkingDirectory=/home/isucon/webapp/go
