@@ -194,8 +194,9 @@ func ownerGetChairs(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	owner := ctx.Value("owner").(*Owner)
 
-	// 窓関数はテーブル全件をソートしてから計算するため、対象オーナーの椅子に絞ってから適用する。
+	// 窓関数はテーブル全件をソートしてから計算するため、対象オーナーの椅子の位置履歴に絞ってから適用する。
 	// 絞らずに chair_locations 全体（数万行）をソートすると、負荷時に数秒かかる。
+	// 外側の chairs は元実装と同じ構造にして、返す列と並び順を変えない。
 	chairs := []chairWithDetail{}
 	if err := db.SelectContext(ctx, &chairs, `SELECT id,
        owner_id,
@@ -207,9 +208,7 @@ func ownerGetChairs(w http.ResponseWriter, r *http.Request) {
        updated_at,
        IFNULL(total_distance, 0) AS total_distance,
        total_distance_updated_at
-FROM (SELECT id, owner_id, name, access_token, model, is_active, created_at, updated_at
-        FROM chairs
-       WHERE owner_id = ?) chairs
+FROM chairs
        LEFT JOIN (SELECT chair_id,
                          SUM(IFNULL(distance, 0)) AS total_distance,
                          MAX(created_at)          AS total_distance_updated_at
@@ -220,6 +219,7 @@ FROM (SELECT id, owner_id, name, access_token, model, is_active, created_at, upd
                             FROM chair_locations
                            WHERE chair_id IN (SELECT id FROM chairs WHERE owner_id = ?)) tmp
                    GROUP BY chair_id) distance_table ON distance_table.chair_id = chairs.id
+WHERE owner_id = ?
 `, owner.ID, owner.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
