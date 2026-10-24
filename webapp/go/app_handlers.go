@@ -632,10 +632,11 @@ func appGetNotification(w http.ResponseWriter, r *http.Request) {
 
 	if notificationSSE {
 		streamNotifications(w, r,
-			func(ctx context.Context) (bool, error) { return appHasUnsentNotification(ctx, user.ID) },
+			func(ctx context.Context) (bool, bool, error) { return appHasUnsentNotification(ctx, user.ID) },
 			func(ctx context.Context) (*appGetNotificationResponseData, bool, error) {
 				return buildAppNotification(ctx, user)
 			},
+			appNotificationIdleInterval,
 		)
 		return
 	}
@@ -651,16 +652,26 @@ func appGetNotification(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// appHasUnsentNotification は、ユーザーの最新ライドに、ユーザーへ未送信のステータスがあるかを返す
-func appHasUnsentNotification(ctx context.Context, userID string) (bool, error) {
-	var exists bool
-	err := db.GetContext(ctx, &exists, `
-SELECT EXISTS (SELECT 1
-               FROM ride_statuses
-               WHERE ride_id = (SELECT id FROM rides WHERE user_id = ? ORDER BY created_at DESC LIMIT 1)
-                 AND app_sent_at IS NULL)
+// ライドがない、または完了を通知し終えたユーザーの確認の間隔。
+// 次の通知はユーザー自身が新しいライドを作るまで来ないので、大きく間引く
+const appNotificationIdleInterval = 1 * time.Second
+
+// appHasUnsentNotification は、ユーザーの最新ライドに、ユーザーへ未送信のステータスがあるかを返す。
+// ライドがない、または最新ライドが完了していて未送信もない（次のライドを待っている）なら idle を返す
+func appHasUnsentNotification(ctx context.Context, userID string) (unsent bool, idle bool, err error) {
+	var state struct {
+		Unsent    bool `db:"unsent"`
+		Completed bool `db:"completed"`
+	}
+	err = db.GetContext(ctx, &state, `
+SELECT EXISTS (SELECT 1 FROM ride_statuses WHERE ride_id = latest_ride.id AND app_sent_at IS NULL)       AS unsent,
+       EXISTS (SELECT 1 FROM ride_statuses WHERE ride_id = latest_ride.id AND status = 'COMPLETED') AS completed
+FROM (SELECT id FROM rides WHERE user_id = ? ORDER BY created_at DESC LIMIT 1) latest_ride
 `, userID)
-	return exists, err
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, true, nil
+	}
+	return state.Unsent, !state.Unsent && state.Completed, err
 }
 
 // buildAppNotification はユーザーへの通知を1件作る。

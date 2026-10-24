@@ -208,10 +208,11 @@ func chairGetNotification(w http.ResponseWriter, r *http.Request) {
 
 	if notificationSSE {
 		streamNotifications(w, r,
-			func(ctx context.Context) (bool, error) { return chairHasUnsentNotification(ctx, chair.ID) },
+			func(ctx context.Context) (bool, bool, error) { return chairHasUnsentNotification(ctx, chair.ID) },
 			func(ctx context.Context) (*chairGetNotificationResponseData, bool, error) {
 				return buildChairNotification(ctx, chair)
 			},
+			chairNotificationIdleInterval,
 		)
 		return
 	}
@@ -227,16 +228,30 @@ func chairGetNotification(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// chairHasUnsentNotification は、椅子の最新ライドに、椅子へ未送信のステータスがあるかを返す
-func chairHasUnsentNotification(ctx context.Context, chairID string) (bool, error) {
-	var exists bool
-	err := db.GetContext(ctx, &exists, `
+// 空いてマッチングを待っている椅子の確認の間隔。マッチングの通知がこの分だけ遅れうるが、
+// マッチングの判定（3 秒以内）に収まるよう控えめにする
+const chairNotificationIdleInterval = 500 * time.Millisecond
+
+// chairHasUnsentNotification は、椅子の今のライドに、椅子へ未送信のステータスがあるかを返す。
+// 今のライドがない、または COMPLETED を通知し終えている（マッチングを待っている）なら idle を返す
+func chairHasUnsentNotification(ctx context.Context, chairID string) (unsent bool, idle bool, err error) {
+	var state struct {
+		Unsent bool `db:"unsent"`
+		Idle   bool `db:"idle"`
+	}
+	err = db.GetContext(ctx, &state, `
 SELECT EXISTS (SELECT 1
                FROM ride_statuses
-               WHERE ride_id = (SELECT ride_id FROM chair_states WHERE chair_id = ?)
-                 AND chair_sent_at IS NULL)
+               WHERE ride_id = chair_states.ride_id
+                 AND chair_sent_at IS NULL) AS unsent,
+       chair_states.completed_sent        AS idle
+FROM chair_states
+WHERE chair_id = ?
 `, chairID)
-	return exists, err
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, true, nil
+	}
+	return state.Unsent, state.Idle, err
 }
 
 // buildChairNotification は椅子への通知を1件作る。
