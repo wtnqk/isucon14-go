@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"sync"
+
+	"github.com/jmoiron/sqlx"
 )
 
 // matcher の呼び出しが重なっても、同じ椅子を二重に割り当てないようにする
@@ -32,10 +35,9 @@ func internalGetMatching(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 空き椅子 = 受付中で、割り当て済みのライドの通知（6状態）をすべて椅子に送り終えている椅子。
-	// 椅子には前のライドが終わってから次を割り当てるので、未完了になり得るのは最後に割り当てたライド
-	// （updated_at が最新のもの）だけ。それだけを調べる。
-	// 最新の位置は chair_total_distances（座標送信のたびに更新）から、最新のライドは MAX + GROUP BY で取る。
+	// 空き椅子 = 受付中で、今のライドがない（一度も割り当てられていない）か、
+	// 今のライドの COMPLETED を椅子に通知し終えている椅子（chair_states を参照）。
+	// 最新の位置は chair_total_distances（座標送信のたびに更新）から取る。
 	// 位置が未送信の椅子は距離が分からないので、次回以降に回す
 	chairs := []matchingChair{}
 	if err := db.SelectContext(ctx, &chairs, `
@@ -46,20 +48,14 @@ SELECT chairs.id,
 FROM chairs
        INNER JOIN chair_models ON chair_models.name = chairs.model
        INNER JOIN chair_total_distances ON chair_total_distances.chair_id = chairs.id
-       LEFT JOIN (SELECT chair_id, MAX(updated_at) AS updated_at
-                  FROM rides
-                  WHERE chair_id IS NOT NULL
-                  GROUP BY chair_id) latest_ride ON latest_ride.chair_id = chairs.id
+       LEFT JOIN chair_states ON chair_states.chair_id = chairs.id
 WHERE chairs.is_active = TRUE
-  AND NOT EXISTS (SELECT 1
-                  FROM rides
-                  WHERE rides.chair_id = chairs.id
-                    AND rides.updated_at = latest_ride.updated_at
-                    AND (SELECT COUNT(chair_sent_at) FROM ride_statuses WHERE ride_id = rides.id) < 6)
+  AND (chair_states.chair_id IS NULL OR chair_states.completed_sent = TRUE)
 `); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+
 	for _, ride := range rides {
 		if len(chairs) == 0 {
 			break
@@ -74,7 +70,7 @@ WHERE chairs.is_active = TRUE
 			}
 		}
 
-		if _, err := db.ExecContext(ctx, "UPDATE rides SET chair_id = ? WHERE id = ? AND chair_id IS NULL", chairs[best].ID, ride.ID); err != nil {
+		if err := assignRide(r, ride.ID, chairs[best].ID); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -82,4 +78,45 @@ WHERE chairs.is_active = TRUE
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// assignRide はライドに椅子を割り当て、椅子の今のライド（chair_states）を更新する。
+// ライドが既に割り当て済みなら何もしない
+func assignRide(r *http.Request, rideID, chairID string) error {
+	ctx := r.Context()
+	tx, err := db.Beginx()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(ctx, "UPDATE rides SET chair_id = ? WHERE id = ? AND chair_id IS NULL", chairID, rideID)
+	if err != nil {
+		return err
+	}
+	if n, err := result.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return nil
+	}
+
+	// 割り当てた時点のライドの状態は MATCHING（ライド作成時に記録される）
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO chair_states (chair_id, ride_id, ride_status, completed_sent)
+VALUES (?, ?, 'MATCHING', FALSE)
+ON DUPLICATE KEY UPDATE ride_id        = VALUES(ride_id),
+                        ride_status    = VALUES(ride_status),
+                        completed_sent = VALUES(completed_sent)`,
+		chairID, rideID); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+// updateChairRideStatus は、椅子に割り当て済みのライドのステータスを記録したときに、
+// 同じトランザクションで椅子の今のライドの状態（chair_states.ride_status）も更新する
+func updateChairRideStatus(ctx context.Context, tx *sqlx.Tx, chairID, rideID, status string) error {
+	_, err := tx.ExecContext(ctx, "UPDATE chair_states SET ride_status = ? WHERE chair_id = ? AND ride_id = ?", status, chairID, rideID)
+	return err
 }

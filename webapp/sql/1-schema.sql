@@ -61,6 +61,20 @@ CREATE TABLE chair_total_distances
 )
   COMMENT = '椅子の移動距離の合計';
 
+-- 椅子の今のライド（最後に割り当てたライド）と、その状態。空き椅子の判定や座標送信で、
+-- rides と ride_statuses から毎回割り出さずに済むよう、割り当てと状態の変化のたびに更新する。
+-- 行がない椅子は、一度もライドを割り当てられていない
+DROP TABLE IF EXISTS chair_states;
+CREATE TABLE chair_states
+(
+  chair_id       VARCHAR(26)  NOT NULL COMMENT '椅子ID',
+  ride_id        VARCHAR(26)  NOT NULL COMMENT '今のライド（最後に割り当てたライド）のID',
+  ride_status    VARCHAR(255) NOT NULL COMMENT '今のライドの最新ステータス',
+  completed_sent TINYINT(1)   NOT NULL COMMENT '今のライドの COMPLETED を椅子に通知し終えたか',
+  PRIMARY KEY (chair_id)
+)
+  COMMENT = '椅子の今のライドの状態';
+
 DROP TABLE IF EXISTS users;
 CREATE TABLE users
 (

@@ -537,6 +537,9 @@ func appPostRideEvaluatation(w http.ResponseWriter, r *http.Request) {
 		ctx,
 		`INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)`,
 		ulid.Make().String(), rideID, "COMPLETED")
+	if err == nil {
+		err = updateChairRideStatus(ctx, tx, ride.ChairID.String, rideID, "COMPLETED")
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -825,10 +828,8 @@ func appGetNearbyChairs(w http.ResponseWriter, r *http.Request) {
 
 	coordinate := Coordinate{Latitude: lat, Longitude: lon}
 
-	// 受付中で、位置を送信済みで、ライドが完了している（または一度もない）椅子を1クエリで取る。
-	// 椅子には前のライドが終わってから次を割り当てるので、未完了になり得るのは最後に割り当てたライド
-	// （updated_at が最新のもの）だけ。COMPLETED は最後の状態なので、それがあれば完了している。
-	// 最新の位置は chair_total_distances（座標送信のたびに更新）から、最新のライドは MAX + GROUP BY で取る
+	// 受付中で、位置を送信済みで、今のライドが完了している（または一度もない）椅子を1クエリで取る。
+	// 最新の位置は chair_total_distances（座標送信のたびに更新）から、今のライドの状態は chair_states から取る
 	type availableChair struct {
 		ID        string `db:"id"`
 		Name      string `db:"name"`
@@ -845,16 +846,9 @@ SELECT chairs.id,
        chair_total_distances.last_longitude AS longitude
 FROM chairs
        INNER JOIN chair_total_distances ON chair_total_distances.chair_id = chairs.id
-       LEFT JOIN (SELECT chair_id, MAX(updated_at) AS updated_at
-                  FROM rides
-                  WHERE chair_id IS NOT NULL
-                  GROUP BY chair_id) latest_ride ON latest_ride.chair_id = chairs.id
+       LEFT JOIN chair_states ON chair_states.chair_id = chairs.id
 WHERE chairs.is_active = TRUE
-  AND NOT EXISTS (SELECT 1
-                  FROM rides
-                  WHERE rides.chair_id = chairs.id
-                    AND rides.updated_at = latest_ride.updated_at
-                    AND NOT EXISTS (SELECT 1 FROM ride_statuses WHERE ride_id = rides.id AND status = 'COMPLETED'))
+  AND (chair_states.chair_id IS NULL OR chair_states.ride_status = 'COMPLETED')
 ORDER BY chairs.id
 `)
 	if err != nil {
