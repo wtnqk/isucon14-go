@@ -34,8 +34,8 @@ func chairPostChairs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	owner := &Owner{}
-	if err := db.GetContext(ctx, owner, "SELECT * FROM owners WHERE chair_register_token = ?", req.ChairRegisterToken); err != nil {
+	owner, err := getOwnerByRegisterToken(ctx, req.ChairRegisterToken)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusUnauthorized, errors.New("invalid chair_register_token"))
 			return
@@ -47,7 +47,7 @@ func chairPostChairs(w http.ResponseWriter, r *http.Request) {
 	chairID := ulid.Make().String()
 	accessToken := secureRandomStr(32)
 
-	_, err := db.ExecContext(
+	_, err = db.ExecContext(
 		ctx,
 		"INSERT INTO chairs (id, owner_id, name, model, is_active, access_token) VALUES (?, ?, ?, ?, ?, ?)",
 		chairID, owner.ID, req.Name, req.Model, false, accessToken,
@@ -264,8 +264,8 @@ func buildChairNotification(ctx context.Context, chair *Chair) (data *chairGetNo
 		status = yetSentRideStatus.Status
 	}
 
-	user := &User{}
-	if err := tx.GetContext(ctx, user, "SELECT * FROM users WHERE id = ? FOR SHARE", ride.UserID); err != nil {
+	user, err := getUserByID(ctx, ride.UserID)
+	if err != nil {
 		return nil, false, err
 	}
 
