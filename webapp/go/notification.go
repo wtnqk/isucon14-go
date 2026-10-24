@@ -18,16 +18,15 @@ const notificationCheckInterval = 200 * time.Millisecond
 
 // streamNotifications は SSE の接続を保ち、通知を送り続ける。
 // app サーバーが複数台でも動くよう、アプリ内で通知を受け渡さず、接続ごとに DB を定期的に確認する。
-//   - hasUnsent: 未送信の状態があるかを、軽いクエリで確認する。あわせて、しばらく通知が来ない状態
-//     （ライドが終わって次を待っているなど）かを idle で返す
+//   - hasUnsent: 未送信の状態があるかを、軽いクエリで確認する。あわせて、次の確認までの間隔を next で返す
+//     （0 なら notificationCheckInterval）。次の大事な通知までしばらくかかると分かっている状態だけ、
+//     確認を間引いて DB の負荷を下げる
 //   - build: 通知を1件作る。未送信の状態があれば古いものを1件送信済みにして consumed=true を返す。ライドが無ければ nil
-//   - idleInterval: idle のときの確認の間隔。通知の遅れが判定に響かない状態だけ、確認を間引いて DB の負荷を下げる
 func streamNotifications[T any](
 	w http.ResponseWriter,
 	r *http.Request,
-	hasUnsent func(context.Context) (unsent bool, idle bool, err error),
+	hasUnsent func(context.Context) (unsent bool, next time.Duration, err error),
 	build func(context.Context) (data *T, consumed bool, err error),
-	idleInterval time.Duration,
 ) {
 	ctx := r.Context()
 	rc := http.NewResponseController(w)
@@ -54,13 +53,13 @@ func streamNotifications[T any](
 
 	// 接続直後は、未送信がなくても最新の状態を送る（仕様で必須）
 	first := true
-	idle := false
+	var next time.Duration
 	for {
 		// 未送信の状態がある間は、待たずに古い順に続けて送る
 		for {
 			if !first {
-				ok, isIdle, err := hasUnsent(ctx)
-				idle = isIdle
+				ok, nextInterval, err := hasUnsent(ctx)
+				next = nextInterval
 				if err != nil {
 					logStreamError(err)
 					return
@@ -86,8 +85,8 @@ func streamNotifications[T any](
 		}
 
 		wait := notificationCheckInterval
-		if idle {
-			wait = idleInterval
+		if next > 0 {
+			wait = next
 		}
 		select {
 		case <-ctx.Done():

@@ -632,11 +632,10 @@ func appGetNotification(w http.ResponseWriter, r *http.Request) {
 
 	if notificationSSE {
 		streamNotifications(w, r,
-			func(ctx context.Context) (bool, bool, error) { return appHasUnsentNotification(ctx, user.ID) },
+			func(ctx context.Context) (bool, time.Duration, error) { return appHasUnsentNotification(ctx, user.ID) },
 			func(ctx context.Context) (*appGetNotificationResponseData, bool, error) {
 				return buildAppNotification(ctx, user)
 			},
-			appNotificationIdleInterval,
 		)
 		return
 	}
@@ -652,26 +651,77 @@ func appGetNotification(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ライドがない、または完了を通知し終えたユーザーの確認の間隔。
-// 次の通知はユーザー自身が新しいライドを作るまで来ないので、大きく間引く
-const appNotificationIdleInterval = 1 * time.Second
+const (
+	// ライドがない、または完了を通知し終えたユーザーの確認の間隔。
+	// 次の通知はユーザー自身が新しいライドを作るまで来ないので、大きく間引く
+	appNotificationIdleInterval = 1 * time.Second
+	// 椅子の移動中（ENROUTE・CARRYING）に、到着の通知（PICKUP・ARRIVED）まで時間があるときの確認の間隔の上限
+	appNotificationMaxMovingInterval = 1 * time.Second
+	// ベンチの 1 tick の長さ。椅子は 1 tick に最大で「速さ」の距離しか進まない
+	benchTickDuration = 30 * time.Millisecond
+)
 
-// appHasUnsentNotification は、ユーザーの最新ライドに、ユーザーへ未送信のステータスがあるかを返す。
-// ライドがない、または最新ライドが完了していて未送信もない（次のライドを待っている）なら idle を返す
-func appHasUnsentNotification(ctx context.Context, userID string) (unsent bool, idle bool, err error) {
+// appHasUnsentNotification は、ユーザーの最新ライドに、ユーザーへ未送信のステータスがあるかと、次の確認までの間隔を返す。
+//   - ライドがない、または最新ライドが完了して未送信もない：次のライドを自分で作るまで何も来ないので間引く
+//   - 椅子が乗車地点・目的地へ移動中：椅子は 1 tick に最大で速さの距離しか進まないので、残りの距離から
+//     到着（PICKUP・ARRIVED）までの最短の時間が分かる。その半分（200ms〜1 秒）まで間引く。
+//     PICKUP はユーザーの乗車、ARRIVED は評価のきっかけなので、到着が近づいたら間引かない
+func appHasUnsentNotification(ctx context.Context, userID string) (unsent bool, next time.Duration, err error) {
 	var state struct {
-		Unsent    bool `db:"unsent"`
-		Completed bool `db:"completed"`
+		Unsent     bool   `db:"unsent"`
+		Completed  bool   `db:"completed"`
+		RideStatus string `db:"ride_status"`
+		PickupLat  int    `db:"pickup_latitude"`
+		PickupLon  int    `db:"pickup_longitude"`
+		DestLat    int    `db:"destination_latitude"`
+		DestLon    int    `db:"destination_longitude"`
+		ChairLat   int    `db:"chair_latitude"`
+		ChairLon   int    `db:"chair_longitude"`
+		ChairSpeed int    `db:"chair_speed"`
 	}
 	err = db.GetContext(ctx, &state, `
 SELECT EXISTS (SELECT 1 FROM ride_statuses WHERE ride_id = latest_ride.id AND app_sent_at IS NULL)       AS unsent,
-       EXISTS (SELECT 1 FROM ride_statuses WHERE ride_id = latest_ride.id AND status = 'COMPLETED') AS completed
-FROM (SELECT id FROM rides WHERE user_id = ? ORDER BY created_at DESC LIMIT 1) latest_ride
+       EXISTS (SELECT 1 FROM ride_statuses WHERE ride_id = latest_ride.id AND status = 'COMPLETED') AS completed,
+       IFNULL(chair_states.ride_status, '')                                                          AS ride_status,
+       latest_ride.pickup_latitude,
+       latest_ride.pickup_longitude,
+       latest_ride.destination_latitude,
+       latest_ride.destination_longitude,
+       IFNULL(chair_total_distances.last_latitude, 0)                                                AS chair_latitude,
+       IFNULL(chair_total_distances.last_longitude, 0)                                               AS chair_longitude,
+       IFNULL(chair_models.speed, 0)                                                                 AS chair_speed
+FROM (SELECT * FROM rides WHERE user_id = ? ORDER BY created_at DESC LIMIT 1) latest_ride
+       LEFT JOIN chair_states ON chair_states.chair_id = latest_ride.chair_id AND chair_states.ride_id = latest_ride.id
+       LEFT JOIN chair_total_distances ON chair_total_distances.chair_id = latest_ride.chair_id
+       LEFT JOIN chairs ON chairs.id = latest_ride.chair_id
+       LEFT JOIN chair_models ON chair_models.name = chairs.model
 `, userID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, true, nil
+		return false, appNotificationIdleInterval, nil
 	}
-	return state.Unsent, !state.Unsent && state.Completed, err
+	if err != nil {
+		return false, 0, err
+	}
+	if state.Unsent {
+		return true, 0, nil
+	}
+	if state.Completed {
+		return false, appNotificationIdleInterval, nil
+	}
+
+	remaining := -1
+	switch state.RideStatus {
+	case "ENROUTE":
+		remaining = calculateDistance(state.ChairLat, state.ChairLon, state.PickupLat, state.PickupLon)
+	case "CARRYING":
+		remaining = calculateDistance(state.ChairLat, state.ChairLon, state.DestLat, state.DestLon)
+	}
+	if remaining > 0 && state.ChairSpeed > 0 {
+		ticks := (remaining + state.ChairSpeed - 1) / state.ChairSpeed
+		next = time.Duration(ticks) * benchTickDuration / 2
+		next = max(notificationCheckInterval, min(next, appNotificationMaxMovingInterval))
+	}
+	return false, next, nil
 }
 
 // buildAppNotification はユーザーへの通知を1件作る。

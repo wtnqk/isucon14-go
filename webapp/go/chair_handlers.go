@@ -209,11 +209,12 @@ func chairGetNotification(w http.ResponseWriter, r *http.Request) {
 
 	if notificationSSE {
 		streamNotifications(w, r,
-			func(ctx context.Context) (bool, bool, error) { return chairHasUnsentNotification(ctx, chair.ID) },
+			func(ctx context.Context) (bool, time.Duration, error) {
+				return chairHasUnsentNotification(ctx, chair.ID)
+			},
 			func(ctx context.Context) (*chairGetNotificationResponseData, bool, error) {
 				return buildChairNotification(ctx, chair)
 			},
-			chairNotificationIdleInterval,
 		)
 		return
 	}
@@ -229,30 +230,46 @@ func chairGetNotification(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// 空いてマッチングを待っている椅子の確認の間隔。マッチングの通知がこの分だけ遅れうるが、
-// マッチングの判定（3 秒以内）に収まるよう控えめにする
-const chairNotificationIdleInterval = 500 * time.Millisecond
+const (
+	// 空いてマッチングを待っている椅子の確認の間隔。マッチングの通知がこの分だけ遅れうるが、
+	// マッチングの判定（3 秒以内）に収まるよう控えめにする
+	chairNotificationIdleInterval = 500 * time.Millisecond
+	// ライドの途中（ENROUTE・PICKUP・CARRYING）の椅子の確認の間隔。この間に椅子へ届く通知は、
+	// 椅子が自分で到着を判断して動くので、遅れても椅子の動きに影響しない（順番どおりに届けばよい）。
+	// ARRIVED のあいだは、COMPLETED が届くまで次のライドに入れないので、間引かない
+	chairNotificationRidingInterval = 1 * time.Second
+)
 
-// chairHasUnsentNotification は、椅子の今のライドに、椅子へ未送信のステータスがあるかを返す。
-// 今のライドがない、または COMPLETED を通知し終えている（マッチングを待っている）なら idle を返す
-func chairHasUnsentNotification(ctx context.Context, chairID string) (unsent bool, idle bool, err error) {
+// chairHasUnsentNotification は、椅子の今のライドに、椅子へ未送信のステータスがあるかと、次の確認までの間隔を返す
+func chairHasUnsentNotification(ctx context.Context, chairID string) (unsent bool, next time.Duration, err error) {
 	var state struct {
-		Unsent bool `db:"unsent"`
-		Idle   bool `db:"idle"`
+		Unsent        bool   `db:"unsent"`
+		CompletedSent bool   `db:"completed_sent"`
+		RideStatus    string `db:"ride_status"`
 	}
 	err = db.GetContext(ctx, &state, `
 SELECT EXISTS (SELECT 1
                FROM ride_statuses
                WHERE ride_id = chair_states.ride_id
                  AND chair_sent_at IS NULL) AS unsent,
-       chair_states.completed_sent        AS idle
+       chair_states.completed_sent,
+       chair_states.ride_status
 FROM chair_states
 WHERE chair_id = ?
 `, chairID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, true, nil
+		return false, chairNotificationIdleInterval, nil
 	}
-	return state.Unsent, state.Idle, err
+	if err != nil {
+		return false, 0, err
+	}
+	switch {
+	case state.CompletedSent:
+		next = chairNotificationIdleInterval
+	case state.RideStatus == "ENROUTE" || state.RideStatus == "PICKUP" || state.RideStatus == "CARRYING":
+		next = chairNotificationRidingInterval
+	}
+	return state.Unsent, next, nil
 }
 
 // buildChairNotification は椅子への通知を1件作る。
