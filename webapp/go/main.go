@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -58,11 +59,16 @@ func setup() http.Handler {
 	dbConfig.Net = "tcp"
 	dbConfig.DBName = dbname
 	dbConfig.ParseTime = true
+	dbConfig.InterpolateParams = true
 
 	_db, err := sqlx.Connect("mysql", dbConfig.FormatDSN())
 	if err != nil {
 		panic(err)
 	}
+	// MaxIdleConns の既定値は 2 で、同時リクエストが増えると接続の張り直しが多発するため広げる
+	_db.SetMaxOpenConns(100)
+	_db.SetMaxIdleConns(100)
+	_db.SetConnMaxLifetime(100 * time.Second)
 	db = _db
 
 	mux := chi.NewRouter()
