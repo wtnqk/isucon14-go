@@ -131,18 +131,25 @@ ON DUPLICATE KEY UPDATE total_distance            = total_distance + ABS(VALUES(
 		return
 	}
 
-	ride := &Ride{}
-	if err := tx.GetContext(ctx, ride, `SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1`, chair.ID); err != nil {
+	// 椅子の最新ライドと、その最新ステータスを1クエリで取る
+	var ride struct {
+		Ride
+		Status string `db:"status"`
+	}
+	if err := tx.GetContext(ctx, &ride, `
+SELECT rides.*,
+       (SELECT status FROM ride_statuses WHERE ride_id = rides.id ORDER BY created_at DESC LIMIT 1) AS status
+FROM rides
+WHERE chair_id = ?
+ORDER BY updated_at DESC
+LIMIT 1
+`, chair.ID); err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 	} else {
-		status, err := getLatestRideStatus(ctx, tx, ride.ID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
+		status := ride.Status
 		if status != "COMPLETED" && status != "CANCELED" {
 			if req.Latitude == ride.PickupLatitude && req.Longitude == ride.PickupLongitude && status == "ENROUTE" {
 				if _, err := tx.ExecContext(ctx, "INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)", ulid.Make().String(), ride.ID, "PICKUP"); err != nil {
