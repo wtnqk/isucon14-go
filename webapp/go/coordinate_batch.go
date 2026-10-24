@@ -35,6 +35,63 @@ var (
 	coordinateFlushMu sync.Mutex
 )
 
+// 書き込みが追いついているかを確かめるため、5 秒ごとにまとめてログに出す
+const coordinateStatsInterval = 5 * time.Second
+
+type coordinateFlushStats struct {
+	flushes     int
+	points      int
+	maxBatch    int
+	totalTime   time.Duration
+	maxTime     time.Duration
+	maxLag      time.Duration // 書き込んだ座標のうち、受け取ってから書き終わるまでに一番長くかかったもの
+	errors      int
+	lastLogTime time.Time
+}
+
+var (
+	coordinateStatsMu sync.Mutex
+	coordinateStats   coordinateFlushStats
+)
+
+func recordCoordinateFlush(batch []pendingCoordinate, elapsed time.Duration, err error) {
+	now := time.Now()
+	coordinateStatsMu.Lock()
+	defer coordinateStatsMu.Unlock()
+	st := &coordinateStats
+	if st.lastLogTime.IsZero() {
+		st.lastLogTime = now
+	}
+	st.flushes++
+	if err != nil {
+		st.errors++
+	} else {
+		st.points += len(batch)
+		if len(batch) > 0 {
+			st.maxLag = max(st.maxLag, now.Sub(batch[0].RecordedAt))
+		}
+	}
+	st.maxBatch = max(st.maxBatch, len(batch))
+	st.totalTime += elapsed
+	st.maxTime = max(st.maxTime, elapsed)
+	if now.Sub(st.lastLogTime) < coordinateStatsInterval {
+		return
+	}
+	pendingCoordinatesMu.Lock()
+	pending := len(pendingCoordinates)
+	pendingCoordinatesMu.Unlock()
+	slog.Info("coordinate flush",
+		"flushes", st.flushes,
+		"points", st.points,
+		"max_batch", st.maxBatch,
+		"avg_ms", st.totalTime.Milliseconds()/int64(st.flushes),
+		"max_ms", st.maxTime.Milliseconds(),
+		"max_lag_ms", st.maxLag.Milliseconds(),
+		"pending", pending,
+		"errors", st.errors)
+	coordinateStats = coordinateFlushStats{lastLogTime: now}
+}
+
 func enqueueCoordinate(c pendingCoordinate) {
 	pendingCoordinatesMu.Lock()
 	pendingCoordinates = append(pendingCoordinates, c)
@@ -76,7 +133,10 @@ func flushCoordinates(ctx context.Context) error {
 		return nil
 	}
 
-	if err := writeCoordinates(ctx, batch); err != nil {
+	start := time.Now()
+	err := writeCoordinates(ctx, batch)
+	recordCoordinateFlush(batch, time.Since(start), err)
+	if err != nil {
 		// 書けなかった分は、後から届いた分より前に戻して次回に回す（椅子ごとの順番を保つため）
 		pendingCoordinatesMu.Lock()
 		pendingCoordinates = append(batch, pendingCoordinates...)
