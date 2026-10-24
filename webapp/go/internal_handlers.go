@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/jmoiron/sqlx"
@@ -16,6 +17,11 @@ type matchingChair struct {
 	Speed     int    `db:"speed"`
 	Latitude  int    `db:"latitude"`
 	Longitude int    `db:"longitude"`
+}
+
+type matchingAssignment struct {
+	RideID  string
+	ChairID string
 }
 
 // このAPIをインスタンス内から一定間隔で叩かせることで、椅子とライドをマッチングさせる
@@ -56,6 +62,8 @@ WHERE chairs.is_active = TRUE
 		return
 	}
 
+	// 割り当てる組み合わせを先にすべて決める
+	assignments := []matchingAssignment{}
 	for _, ride := range rides {
 		if len(chairs) == 0 {
 			break
@@ -70,48 +78,84 @@ WHERE chairs.is_active = TRUE
 			}
 		}
 
-		if err := assignRide(r, ride.ID, chairs[best].ID); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
+		assignments = append(assignments, matchingAssignment{RideID: ride.ID, ChairID: chairs[best].ID})
 		chairs = append(chairs[:best], chairs[best+1:]...)
+	}
+
+	if err := assignRides(ctx, assignments); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// assignRide はライドに椅子を割り当て、椅子の今のライド（chair_states）を更新する。
-// ライドが既に割り当て済みなら何もしない
-func assignRide(r *http.Request, rideID, chairID string) error {
-	ctx := r.Context()
-	tx, err := db.Beginx()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	result, err := tx.ExecContext(ctx, "UPDATE rides SET chair_id = ? WHERE id = ? AND chair_id IS NULL", chairID, rideID)
-	if err != nil {
-		return err
-	}
-	if n, err := result.RowsAffected(); err != nil {
-		return err
-	} else if n == 0 {
+// assignRides は、ライドへの椅子の割り当てと、椅子の今のライド（chair_states）の更新を、
+// 件数にかかわらず 1 つのトランザクションの 2 文で行う（1 件ずつ書くと、件数に比例して DB との往復が増えるため）。
+// 割り当て済みのライドが混ざっていて更新件数が合わなければ、ロールバックして 1 件ずつ処理し直す
+// （割り当て済みのライドは飛ばす）
+func assignRides(ctx context.Context, assignments []matchingAssignment) error {
+	if len(assignments) == 0 {
 		return nil
 	}
 
-	// 割り当てた時点のライドの状態は MATCHING（ライド作成時に記録される）
-	if _, err := tx.ExecContext(ctx, `
-INSERT INTO chair_states (chair_id, ride_id, ride_status, completed_sent)
-VALUES (?, ?, 'MATCHING', FALSE)
-ON DUPLICATE KEY UPDATE ride_id        = VALUES(ride_id),
-                        ride_status    = VALUES(ride_status),
-                        completed_sent = VALUES(completed_sent)`,
-		chairID, rideID); err != nil {
+	ok, err := assignRidesBulk(ctx, assignments)
+	if err != nil || ok {
 		return err
 	}
 
-	return tx.Commit()
+	for _, a := range assignments {
+		if _, err := assignRidesBulk(ctx, []matchingAssignment{a}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// assignRidesBulk は assignments をまとめて書き込む。
+// いずれかのライドが既に割り当て済みだった（更新件数が合わない）場合は、何も書かずに false を返す
+func assignRidesBulk(ctx context.Context, assignments []matchingAssignment) (bool, error) {
+	tx, err := db.Beginx()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	// UPDATE rides SET chair_id = CASE id WHEN ? THEN ? ... END WHERE id IN (?, ...) AND chair_id IS NULL
+	caseArgs := make([]any, 0, len(assignments)*2)
+	inArgs := make([]any, 0, len(assignments))
+	for _, a := range assignments {
+		caseArgs = append(caseArgs, a.RideID, a.ChairID)
+		inArgs = append(inArgs, a.RideID)
+	}
+	query := "UPDATE rides SET chair_id = CASE id" + strings.Repeat(" WHEN ? THEN ?", len(assignments)) +
+		" END WHERE id IN (?" + strings.Repeat(", ?", len(assignments)-1) + ") AND chair_id IS NULL"
+	result, err := tx.ExecContext(ctx, query, append(caseArgs, inArgs...)...)
+	if err != nil {
+		return false, err
+	}
+	if n, err := result.RowsAffected(); err != nil {
+		return false, err
+	} else if n != int64(len(assignments)) {
+		return false, nil
+	}
+
+	// 割り当てた時点のライドの状態は MATCHING（ライド作成時に記録される）
+	stateArgs := make([]any, 0, len(assignments)*2)
+	for _, a := range assignments {
+		stateArgs = append(stateArgs, a.ChairID, a.RideID)
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO chair_states (chair_id, ride_id, ride_status, completed_sent)
+VALUES `+"(?, ?, 'MATCHING', FALSE)"+strings.Repeat(", (?, ?, 'MATCHING', FALSE)", len(assignments)-1)+`
+ON DUPLICATE KEY UPDATE ride_id        = VALUES(ride_id),
+                        ride_status    = VALUES(ride_status),
+                        completed_sent = VALUES(completed_sent)`,
+		stateArgs...); err != nil {
+		return false, err
+	}
+
+	return true, tx.Commit()
 }
 
 // updateChairRideStatus は、椅子に割り当て済みのライドのステータスを記録したときに、
