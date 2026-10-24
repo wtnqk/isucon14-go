@@ -41,6 +41,7 @@ const coordinateStatsInterval = 5 * time.Second
 type coordinateFlushStats struct {
 	flushes     int
 	points      int
+	arrivals    int
 	maxBatch    int
 	totalTime   time.Duration
 	maxTime     time.Duration
@@ -54,7 +55,7 @@ var (
 	coordinateStats   coordinateFlushStats
 )
 
-func recordCoordinateFlush(batch []pendingCoordinate, elapsed time.Duration, err error) {
+func recordCoordinateFlush(batch []pendingCoordinate, arrivals int, elapsed time.Duration, err error) {
 	now := time.Now()
 	coordinateStatsMu.Lock()
 	defer coordinateStatsMu.Unlock()
@@ -67,6 +68,7 @@ func recordCoordinateFlush(batch []pendingCoordinate, elapsed time.Duration, err
 		st.errors++
 	} else {
 		st.points += len(batch)
+		st.arrivals += arrivals
 		if len(batch) > 0 {
 			st.maxLag = max(st.maxLag, now.Sub(batch[0].RecordedAt))
 		}
@@ -83,6 +85,7 @@ func recordCoordinateFlush(batch []pendingCoordinate, elapsed time.Duration, err
 	slog.Info("coordinate flush",
 		"flushes", st.flushes,
 		"points", st.points,
+		"arrivals", st.arrivals,
 		"max_batch", st.maxBatch,
 		"avg_ms", st.totalTime.Milliseconds()/int64(st.flushes),
 		"max_ms", st.maxTime.Milliseconds(),
@@ -134,8 +137,8 @@ func flushCoordinates(ctx context.Context) error {
 	}
 
 	start := time.Now()
-	err := writeCoordinates(ctx, batch)
-	recordCoordinateFlush(batch, time.Since(start), err)
+	arrivals, err := writeCoordinates(ctx, batch)
+	recordCoordinateFlush(batch, arrivals, time.Since(start), err)
 	if err != nil {
 		// 書けなかった分は、後から届いた分より前に戻して次回に回す（椅子ごとの順番を保つため）
 		pendingCoordinatesMu.Lock()
@@ -146,10 +149,11 @@ func flushCoordinates(ctx context.Context) error {
 	return nil
 }
 
-// writeCoordinates は、届いた座標を 1 つのトランザクションで書き込む。
+// writeCoordinates は、届いた座標を 1 つのトランザクションで書き込み、記録した到着の件数を返す。
+// 件数にかかわらず文の数は一定にする（1 回が遅くなると次の回に溜まる件数が増え、さらに遅くなるため）。
 //   - 移動距離の合計：前回の座標から、届いた順に座標の差を足す。最新の座標と、最後に受け取った時刻も更新する
 //   - 到着の判定：乗車地点（ENROUTE のとき）・目的地（CARRYING のとき）に着いたら PICKUP・ARRIVED を記録する
-func writeCoordinates(ctx context.Context, batch []pendingCoordinate) error {
+func writeCoordinates(ctx context.Context, batch []pendingCoordinate) (int, error) {
 	// 椅子ごとに、届いた順に並べる
 	chairIDs := []string{}
 	byChair := map[string][]pendingCoordinate{}
@@ -162,7 +166,7 @@ func writeCoordinates(ctx context.Context, batch []pendingCoordinate) error {
 
 	tx, err := db.Beginx()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer tx.Rollback()
 
@@ -175,11 +179,11 @@ func writeCoordinates(ctx context.Context, batch []pendingCoordinate) error {
 	}
 	query, args, err := sqlx.In(`SELECT chair_id, total_distance, last_latitude, last_longitude FROM chair_total_distances WHERE chair_id IN (?) FOR UPDATE`, chairIDs)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	distances := []distanceRow{}
 	if err := tx.SelectContext(ctx, &distances, query, args...); err != nil {
-		return err
+		return 0, err
 	}
 	prevByChair := map[string]distanceRow{}
 	for _, d := range distances {
@@ -208,11 +212,11 @@ FROM chair_states
        INNER JOIN rides ON rides.id = chair_states.ride_id
 WHERE chair_states.chair_id IN (?)`, chairIDs)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	rides := []rideRow{}
 	if err := tx.SelectContext(ctx, &rides, query, args...); err != nil {
-		return err
+		return 0, err
 	}
 	rideByChair := map[string]rideRow{}
 	for _, r := range rides {
@@ -264,17 +268,31 @@ ON DUPLICATE KEY UPDATE total_distance            = VALUES(total_distance),
                         last_latitude             = VALUES(last_latitude),
                         last_longitude            = VALUES(last_longitude)`,
 		distanceArgs...); err != nil {
-		return err
+		return 0, err
 	}
 
-	for _, a := range arrivals {
-		if _, err := tx.ExecContext(ctx, "INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)", ulid.Make().String(), a.RideID, a.Status); err != nil {
-			return err
+	if len(arrivals) > 0 {
+		statusArgs := make([]any, 0, len(arrivals)*3)
+		caseArgs := make([]any, 0, len(arrivals)*2)
+		inArgs := make([]any, 0, len(arrivals)*2)
+		for _, a := range arrivals {
+			statusArgs = append(statusArgs, ulid.Make().String(), a.RideID, a.Status)
+			caseArgs = append(caseArgs, a.ChairID, a.Status)
+			inArgs = append(inArgs, a.ChairID, a.RideID)
 		}
-		if err := updateChairRideStatus(ctx, tx, a.ChairID, a.RideID, a.Status); err != nil {
-			return err
+		if _, err := tx.ExecContext(ctx,
+			"INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)"+strings.Repeat(", (?, ?, ?)", len(arrivals)-1),
+			statusArgs...); err != nil {
+			return 0, err
+		}
+		// updateChairRideStatus と同じく、今のライドが到着したライドのときだけ更新する
+		if _, err := tx.ExecContext(ctx,
+			"UPDATE chair_states SET ride_status = CASE chair_id"+strings.Repeat(" WHEN ? THEN ?", len(arrivals))+
+				" END WHERE (chair_id, ride_id) IN ((?, ?)"+strings.Repeat(", (?, ?)", len(arrivals)-1)+")",
+			append(caseArgs, inArgs...)...); err != nil {
+			return 0, err
 		}
 	}
 
-	return tx.Commit()
+	return len(arrivals), tx.Commit()
 }
