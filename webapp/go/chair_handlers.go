@@ -132,18 +132,16 @@ ON DUPLICATE KEY UPDATE total_distance            = total_distance + ABS(VALUES(
 		return
 	}
 
-	// 椅子の最新ライドと、その最新ステータスを1クエリで取る
+	// 椅子の今のライドと、その最新ステータスを chair_states から取る
 	var ride struct {
 		Ride
-		Status string `db:"status"`
+		Status string `db:"ride_status"`
 	}
 	if err := tx.GetContext(ctx, &ride, `
-SELECT rides.*,
-       (SELECT status FROM ride_statuses WHERE ride_id = rides.id ORDER BY created_at DESC LIMIT 1) AS status
-FROM rides
-WHERE chair_id = ?
-ORDER BY updated_at DESC
-LIMIT 1
+SELECT rides.*, chair_states.ride_status
+FROM chair_states
+       INNER JOIN rides ON rides.id = chair_states.ride_id
+WHERE chair_states.chair_id = ?
 `, chair.ID); err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusInternalServerError, err)
@@ -157,10 +155,18 @@ LIMIT 1
 					writeError(w, http.StatusInternalServerError, err)
 					return
 				}
+				if err := updateChairRideStatus(ctx, tx, chair.ID, ride.ID, "PICKUP"); err != nil {
+					writeError(w, http.StatusInternalServerError, err)
+					return
+				}
 			}
 
 			if req.Latitude == ride.DestinationLatitude && req.Longitude == ride.DestinationLongitude && status == "CARRYING" {
 				if _, err := tx.ExecContext(ctx, "INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)", ulid.Make().String(), ride.ID, "ARRIVED"); err != nil {
+					writeError(w, http.StatusInternalServerError, err)
+					return
+				}
+				if err := updateChairRideStatus(ctx, tx, chair.ID, ride.ID, "ARRIVED"); err != nil {
 					writeError(w, http.StatusInternalServerError, err)
 					return
 				}
@@ -227,7 +233,7 @@ func chairHasUnsentNotification(ctx context.Context, chairID string) (bool, erro
 	err := db.GetContext(ctx, &exists, `
 SELECT EXISTS (SELECT 1
                FROM ride_statuses
-               WHERE ride_id = (SELECT id FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1)
+               WHERE ride_id = (SELECT ride_id FROM chair_states WHERE chair_id = ?)
                  AND chair_sent_at IS NULL)
 `, chairID)
 	return exists, err
@@ -243,7 +249,12 @@ func buildChairNotification(ctx context.Context, chair *Chair) (data *chairGetNo
 	defer tx.Rollback()
 
 	ride := &Ride{}
-	if err := tx.GetContext(ctx, ride, `SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1`, chair.ID); err != nil {
+	if err := tx.GetContext(ctx, ride, `
+SELECT rides.*
+FROM chair_states
+       INNER JOIN rides ON rides.id = chair_states.ride_id
+WHERE chair_states.chair_id = ?
+`, chair.ID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, false, nil
 		}
@@ -272,6 +283,12 @@ func buildChairNotification(ctx context.Context, chair *Chair) (data *chairGetNo
 	if yetSentRideStatus.ID != "" {
 		if _, err := tx.ExecContext(ctx, `UPDATE ride_statuses SET chair_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?`, yetSentRideStatus.ID); err != nil {
 			return nil, false, err
+		}
+		// COMPLETED を椅子に送ったら、マッチングで次のライドを割り当てられるようにする
+		if yetSentRideStatus.Status == "COMPLETED" {
+			if _, err := tx.ExecContext(ctx, `UPDATE chair_states SET completed_sent = TRUE WHERE chair_id = ? AND ride_id = ?`, chair.ID, ride.ID); err != nil {
+				return nil, false, err
+			}
 		}
 	}
 
@@ -342,6 +359,10 @@ func chairPostRideStatus(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		if err := updateChairRideStatus(ctx, tx, chair.ID, ride.ID, "ENROUTE"); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
 	// After Picking up user
 	case "CARRYING":
 		status, err := getLatestRideStatus(ctx, tx, ride.ID)
@@ -354,6 +375,10 @@ func chairPostRideStatus(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)", ulid.Make().String(), ride.ID, "CARRYING"); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if err := updateChairRideStatus(ctx, tx, chair.ID, ride.ID, "CARRYING"); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
