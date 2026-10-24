@@ -867,7 +867,7 @@ func appGetNearbyChairs(w http.ResponseWriter, r *http.Request) {
 	// 受付中で、位置を送信済みで、ライドが完了している（または一度もない）椅子を1クエリで取る。
 	// 椅子には前のライドが終わってから次を割り当てるので、未完了になり得るのは最後に割り当てたライド
 	// （updated_at が最新のもの）だけ。COMPLETED は最後の状態なので、それがあれば完了している。
-	// 最新の位置・ライドは MAX + GROUP BY で取る（相関サブクエリの ORDER BY ... LIMIT 1 は履歴を全件読むため）
+	// 最新の位置は chair_total_distances（座標送信のたびに更新）から、最新のライドは MAX + GROUP BY で取る
 	type availableChair struct {
 		ID        string `db:"id"`
 		Name      string `db:"name"`
@@ -877,13 +877,13 @@ func appGetNearbyChairs(w http.ResponseWriter, r *http.Request) {
 	}
 	chairs := []availableChair{}
 	err = db.SelectContext(ctx, &chairs, `
-SELECT chairs.id, chairs.name, chairs.model, chair_locations.latitude, chair_locations.longitude
+SELECT chairs.id,
+       chairs.name,
+       chairs.model,
+       chair_total_distances.last_latitude  AS latitude,
+       chair_total_distances.last_longitude AS longitude
 FROM chairs
-       INNER JOIN (SELECT chair_id, MAX(created_at) AS created_at
-                   FROM chair_locations
-                   GROUP BY chair_id) latest_location ON latest_location.chair_id = chairs.id
-       INNER JOIN chair_locations ON chair_locations.chair_id = latest_location.chair_id
-                                 AND chair_locations.created_at = latest_location.created_at
+       INNER JOIN chair_total_distances ON chair_total_distances.chair_id = chairs.id
        LEFT JOIN (SELECT chair_id, MAX(updated_at) AS updated_at
                   FROM rides
                   WHERE chair_id IS NOT NULL
@@ -902,14 +902,7 @@ ORDER BY chairs.id
 	}
 
 	nearbyChairs := []appGetNearbyChairsResponseChair{}
-	seen := make(map[string]bool, len(chairs))
 	for _, chair := range chairs {
-		// 同じ時刻の位置が2件あると椅子が2行になるので、1つにまとめる
-		if seen[chair.ID] {
-			continue
-		}
-		seen[chair.ID] = true
-
 		if calculateDistance(coordinate.Latitude, coordinate.Longitude, chair.Latitude, chair.Longitude) <= distance {
 			nearbyChairs = append(nearbyChairs, appGetNearbyChairsResponseChair{
 				ID:    chair.ID,
@@ -923,16 +916,8 @@ ORDER BY chairs.id
 		}
 	}
 
-	retrievedAt := &time.Time{}
-	err = db.GetContext(
-		ctx,
-		retrievedAt,
-		`SELECT CURRENT_TIMESTAMP(6)`,
-	)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
+	// 座標の recorded_at はアプリの時計で決めているので、retrieved_at も同じ時計にそろえる
+	retrievedAt := time.Now()
 
 	writeJSON(w, http.StatusOK, &appGetNearbyChairsResponse{
 		Chairs:      nearbyChairs,
