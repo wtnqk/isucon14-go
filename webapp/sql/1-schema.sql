@@ -48,6 +48,19 @@ CREATE TABLE chair_locations
 )
   COMMENT = '椅子の現在位置情報テーブル';
 
+-- GET /api/owner/chairs で毎回 chair_locations 全件から集計しないよう、座標送信のたびに加算して持つ
+DROP TABLE IF EXISTS chair_total_distances;
+CREATE TABLE chair_total_distances
+(
+  chair_id                  VARCHAR(26) NOT NULL COMMENT '椅子ID',
+  total_distance            INTEGER     NOT NULL COMMENT '移動距離の合計',
+  total_distance_updated_at DATETIME(6) NOT NULL COMMENT '最後に座標を受け取った日時',
+  last_latitude             INTEGER     NOT NULL COMMENT '最後の座標（経度）',
+  last_longitude            INTEGER     NOT NULL COMMENT '最後の座標（緯度）',
+  PRIMARY KEY (chair_id)
+)
+  COMMENT = '椅子の移動距離の合計';
+
 DROP TABLE IF EXISTS users;
 CREATE TABLE users
 (
