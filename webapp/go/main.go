@@ -70,9 +70,10 @@ func setup() http.Handler {
 	_db.SetMaxIdleConns(100)
 	_db.SetConnMaxLifetime(100 * time.Second)
 	db = _db
+	startCoordinateFlusher()
 
+	// アクセスログは nginx で取っているので、アプリでは出さない（リクエストごとの書き込みで journald が溢れていた）
 	mux := chi.NewRouter()
-	mux.Use(middleware.Logger)
 	mux.Use(middleware.Recoverer)
 	mux.HandleFunc("POST /api/initialize", postInitialize)
 
@@ -134,8 +135,14 @@ func postInitialize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if out, err := exec.Command("../sql/init.sh").CombinedOutput(); err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Errorf("failed to initialize: %s: %w", string(out), err))
+	// 初期化の前にたまっている座標を捨て、初期化の間は座標の書き込みを止める
+	if err := withCoordinatesReset(func() error {
+		if out, err := exec.Command("../sql/init.sh").CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to initialize: %s: %w", string(out), err)
+		}
+		return nil
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	resetCaches()

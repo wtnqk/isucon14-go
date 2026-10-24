@@ -12,7 +12,7 @@
 # 役割（HOST:ROLE。省略時は app）:
 #   app    webapp/go を送ってビルドし、APP_SERVICE を再起動する
 #   db     webapp/sql を送るだけ。WEB_SERVICE を再起動する（nginx など。空なら再起動しない）
-#   nginx  DOMAIN の nginx 設定を送って nginx を再起動する
+#   nginx  nginx 本体の nginx.conf と DOMAIN の isuride.conf を送って nginx を再起動する
 #
 # 3台構成の例:
 #   scripts/deploy.sh app1:app app3:db app2:nginx
@@ -186,12 +186,18 @@ stage=$1 root=$2 go=$3 bin=$4 app_svc=$5 health=$6 short=$7 subject=$8 deployer=
 # nginx の設定は反映先が /home/isucon/webapp ではないので、ここで別に扱う
 if [ "$role" = "nginx" ]; then
     # provisioning/... ごと固めて展開しているので、リポジトリ内の配置をそのまま辿る
-    conf="$stage/provisioning/ansible/roles/nginx/files/etc/nginx/sites-available/isuride.conf"
-    if [ ! -f "$conf" ]; then
-        echo "!! nginx 設定がステージングに無い: $conf" >&2
-        exit 1
-    fi
+    # 送るのは本体の nginx.conf と isuride.conf の 2 つ
+    files="$stage/provisioning/ansible/roles/nginx/files"
+    conf="$files/etc/nginx/sites-available/isuride.conf"
+    main_conf="$files/etc/nginx/nginx.conf"
+    for f in "$conf" "$main_conf"; do
+        if [ ! -f "$f" ]; then
+            echo "!! nginx 設定がステージングに無い: $f" >&2
+            exit 1
+        fi
+    done
     target=/etc/nginx/sites-available/isuride.conf
+    main_target=/etc/nginx/nginx.conf
     checkdir="/home/isucon/.deploy/nginx-check"
 
     # 1. 稼働中の /etc/nginx のコピーを作り、そこに候補の設定を入れて検証する。
@@ -200,6 +206,7 @@ if [ "$role" = "nginx" ]; then
     sudo rm -rf "$checkdir"
     sudo mkdir -p "$checkdir"
     sudo cp -a /etc/nginx/. "$checkdir/"
+    sudo cp "$main_conf" "$checkdir/nginx.conf"
     sudo rm -f "$checkdir/sites-enabled/isuride.conf"
     sudo cp "$conf" "$checkdir/sites-available/isuride.conf"
     # リンクは消すのではなく、コピー先の設定を指すように張り直す（消すと検証対象が読み込まれない）
@@ -223,13 +230,17 @@ if [ "$role" = "nginx" ]; then
     rm -f "$tlog"
 
     # 2. 検証を通った候補だけを本物の設定にする。旧設定は退避しておき、失敗したら戻す
-    backup="$target.bak-deploy-$(date +%Y%m%d%H%M%S)"
-    sudo cp -a "$target" "$backup"
+    #    検証用の nginx.conf はパスを読み替えているので、本物には送られてきたものを置く
+    suffix=".bak-deploy-$(date +%Y%m%d%H%M%S)"
+    sudo cp -a "$target" "$target$suffix"
+    sudo cp -a "$main_target" "$main_target$suffix"
     sudo cp "$checkdir/sites-available/isuride.conf" "$target"
+    sudo cp "$main_conf" "$main_target"
     if ! sudo nginx -t; then
-        sudo cp -a "$backup" "$target"
+        sudo cp -a "$target$suffix" "$target"
+        sudo cp -a "$main_target$suffix" "$main_target"
         sudo rm -rf "$checkdir"
-        echo "!! 配置後の nginx -t が失敗したので $backup から戻した" >&2
+        echo "!! 配置後の nginx -t が失敗したので $target$suffix と $main_target$suffix から戻した" >&2
         exit 1
     fi
     sudo rm -rf "$checkdir"
