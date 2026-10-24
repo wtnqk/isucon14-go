@@ -1,8 +1,8 @@
 [Unit]
 Description=isuride-go
 After=syslog.target
-After=mysql.service
-Requires=mysql.service
+# MySQL は別の台（db）で動くので、起動順序の依存は持たない。
+# 同一ホストで動かす構成に戻すなら After=mysql.service / Requires=mysql.service を戻す。
 
 [Service]
 WorkingDirectory=/home/isucon/webapp/go
