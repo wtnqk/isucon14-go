@@ -719,8 +719,8 @@ func buildAppNotification(ctx context.Context, user *User) (data *appGetNotifica
 	}
 
 	if ride.ChairID.Valid {
-		chair := &Chair{}
-		if err := tx.GetContext(ctx, chair, `SELECT * FROM chairs WHERE id = ?`, ride.ChairID); err != nil {
+		chair, err := getChairByID(ctx, ride.ChairID.String)
+		if err != nil {
 			return nil, false, err
 		}
 
