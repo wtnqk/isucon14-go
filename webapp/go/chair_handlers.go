@@ -1,9 +1,9 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 	"net/http"
 
 	"github.com/oklog/ulid/v2"
@@ -86,6 +86,9 @@ func chairPostActivity(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+
+	// 受付状態が変わったので、椅子の通知ストリームに伝える
+	publishChairActive(chair.ID)
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -176,6 +179,13 @@ ON DUPLICATE KEY UPDATE total_distance            = total_distance + ABS(VALUES(
 		return
 	}
 
+	// 位置の更新でライドの状態が変わることがある（PICKUP / ARRIVED）ので関係者に伝える
+	if ride.ID != "" {
+		publishRideChange(ride.UserID, chair.ID)
+	} else {
+		publishChairActive(chair.ID)
+	}
+
 	writeJSON(w, http.StatusOK, &chairPostCoordinateResponse{
 		RecordedAt: location.CreatedAt.UnixMilli(),
 	})
@@ -199,85 +209,27 @@ type chairGetNotificationResponseData struct {
 	Status                string     `json:"status"`
 }
 
+// chairGetNotification は椅子向けの通知を SSE で送り続ける。
+// 接続したら即座に最新の状態を1つ送り、以降は状態が変わるたびに送る。
 func chairGetNotification(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	chair := ctx.Value("chair").(*Chair)
 
-	tx, err := db.Beginx()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	defer tx.Rollback()
-	ride := &Ride{}
-	yetSentRideStatus := RideStatus{}
-	status := ""
-
-	if err := tx.GetContext(ctx, ride, `SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1`, chair.ID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			writeJSON(w, http.StatusOK, &chairGetNotificationResponse{
-				RetryAfterMs: 300,
-			})
-			return
-		}
-		writeError(w, http.StatusInternalServerError, err)
+	sse, ok := newSSEWriter(w)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, errors.New("streaming is not supported"))
 		return
 	}
 
-	if err := tx.GetContext(ctx, &yetSentRideStatus, `SELECT * FROM ride_statuses WHERE ride_id = ? AND chair_sent_at IS NULL ORDER BY created_at ASC LIMIT 1`, ride.ID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			status, err = getLatestRideStatus(ctx, tx, ride.ID)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, err)
-				return
-			}
-		} else {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-	} else {
-		status = yetSentRideStatus.Status
-	}
+	sub := hub.subscribe(topicRideChair+chair.ID, topicChairState+chair.ID)
+	defer hub.unsubscribe(sub)
 
-	user := &User{}
-	err = tx.GetContext(ctx, user, "SELECT * FROM users WHERE id = ? FOR SHARE", ride.UserID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+	if err := streamNotifications(ctx, sse, sub, func(ctx context.Context, cur *notificationCursor) (notificationDelivery, error) {
+		return buildNotification(ctx, notificationAudienceChair, chair.ID, cur)
+	}); err != nil {
+		// 接続が切れただけなので、ログに出す必要はない
 		return
 	}
-
-	if yetSentRideStatus.ID != "" {
-		_, err := tx.ExecContext(ctx, `UPDATE ride_statuses SET chair_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?`, yetSentRideStatus.ID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	writeJSON(w, http.StatusOK, &chairGetNotificationResponse{
-		Data: &chairGetNotificationResponseData{
-			RideID: ride.ID,
-			User: simpleUser{
-				ID:   user.ID,
-				Name: fmt.Sprintf("%s %s", user.Firstname, user.Lastname),
-			},
-			PickupCoordinate: Coordinate{
-				Latitude:  ride.PickupLatitude,
-				Longitude: ride.PickupLongitude,
-			},
-			DestinationCoordinate: Coordinate{
-				Latitude:  ride.DestinationLatitude,
-				Longitude: ride.DestinationLongitude,
-			},
-			Status: status,
-		},
-		RetryAfterMs: 300,
-	})
 }
 
 type postChairRidesRideIDStatusRequest struct {
@@ -348,6 +300,9 @@ func chairPostRideStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+
+	// ENROUTE / CARRYING が確定したので、ライドの関係者に伝える
+	publishRideChange(ride.UserID, chair.ID)
 
 	w.WriteHeader(http.StatusNoContent)
 }

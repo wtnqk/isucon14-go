@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/jmoiron/sqlx"
 	"github.com/oklog/ulid/v2"
 )
 
@@ -281,6 +280,7 @@ type appPostRidesResponse struct {
 type executableGet interface {
 	Get(dest interface{}, query string, args ...interface{}) error
 	GetContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error
+	SelectContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error
 }
 
 func getLatestRideStatus(ctx context.Context, tx executableGet, rideID string) (string, error) {
@@ -431,6 +431,9 @@ func appPostRides(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+
+	// 新しいライド（MATCHING）ができたことをユーザーの通知ストリームに伝える
+	publishRideChange(user.ID, "")
 
 	writeJSON(w, http.StatusAccepted, &appPostRidesResponse{
 		RideID: rideID,
@@ -625,6 +628,9 @@ func appPostRideEvaluatation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// COMPLETED が確定したので、ライドの関係者に伝える
+	publishRideChange(ride.UserID, ride.ChairID.String)
+
 	writeJSON(w, http.StatusOK, &appPostRideEvaluationResponse{
 		CompletedAt: ride.UpdatedAt.UnixMilli(),
 	})
@@ -658,109 +664,30 @@ type appGetNotificationResponseChairStats struct {
 	TotalEvaluationAvg float64 `json:"total_evaluation_avg"`
 }
 
+// appGetNotification はユーザー向けの通知を SSE で送り続ける。
+// 接続したら即座に最新の状態を1つ送り、以降は状態が変わるたびに送る。
 func appGetNotification(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	user := ctx.Value("user").(*User)
 
-	tx, err := db.Beginx()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	defer tx.Rollback()
-
-	ride := &Ride{}
-	if err := tx.GetContext(ctx, ride, `SELECT * FROM rides WHERE user_id = ? ORDER BY created_at DESC LIMIT 1`, user.ID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			writeJSON(w, http.StatusOK, &appGetNotificationResponse{
-				RetryAfterMs: 300,
-			})
-			return
-		}
-		writeError(w, http.StatusInternalServerError, err)
+	sse, ok := newSSEWriter(w)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, errors.New("streaming is not supported"))
 		return
 	}
 
-	yetSentRideStatus := RideStatus{}
-	status := ""
-	if err := tx.GetContext(ctx, &yetSentRideStatus, `SELECT * FROM ride_statuses WHERE ride_id = ? AND app_sent_at IS NULL ORDER BY created_at ASC LIMIT 1`, ride.ID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			status, err = getLatestRideStatus(ctx, tx, ride.ID)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, err)
-				return
-			}
-		} else {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-	} else {
-		status = yetSentRideStatus.Status
-	}
+	sub := hub.subscribe(topicRideUser+user.ID, topicUserNotify+user.ID)
+	defer hub.unsubscribe(sub)
 
-	fare, err := calculateDiscountedFare(ctx, tx, user.ID, ride, ride.PickupLatitude, ride.PickupLongitude, ride.DestinationLatitude, ride.DestinationLongitude)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+	if err := streamNotifications(ctx, sse, sub, func(ctx context.Context, cur *notificationCursor) (notificationDelivery, error) {
+		return buildNotification(ctx, notificationAudienceUser, user.ID, cur)
+	}); err != nil {
+		// 接続が切れただけなので、ログに出す必要はない
 		return
 	}
-
-	response := &appGetNotificationResponse{
-		Data: &appGetNotificationResponseData{
-			RideID: ride.ID,
-			PickupCoordinate: Coordinate{
-				Latitude:  ride.PickupLatitude,
-				Longitude: ride.PickupLongitude,
-			},
-			DestinationCoordinate: Coordinate{
-				Latitude:  ride.DestinationLatitude,
-				Longitude: ride.DestinationLongitude,
-			},
-			Fare:      fare,
-			Status:    status,
-			CreatedAt: ride.CreatedAt.UnixMilli(),
-			UpdateAt:  ride.UpdatedAt.UnixMilli(),
-		},
-		RetryAfterMs: 300,
-	}
-
-	if ride.ChairID.Valid {
-		chair := &Chair{}
-		if err := tx.GetContext(ctx, chair, `SELECT * FROM chairs WHERE id = ?`, ride.ChairID); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-
-		stats, err := getChairStats(ctx, tx, chair.ID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-
-		response.Data.Chair = &appGetNotificationResponseChair{
-			ID:    chair.ID,
-			Name:  chair.Name,
-			Model: chair.Model,
-			Stats: stats,
-		}
-	}
-
-	if yetSentRideStatus.ID != "" {
-		_, err := tx.ExecContext(ctx, `UPDATE ride_statuses SET app_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?`, yetSentRideStatus.ID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	writeJSON(w, http.StatusOK, response)
 }
 
-func getChairStats(ctx context.Context, tx *sqlx.Tx, chairID string) (appGetNotificationResponseChairStats, error) {
+func getChairStats(ctx context.Context, tx executableGet, chairID string) (appGetNotificationResponseChairStats, error) {
 	stats := appGetNotificationResponseChairStats{}
 
 	rides := []Ride{}
@@ -945,7 +872,7 @@ func calculateFare(pickupLatitude, pickupLongitude, destLatitude, destLongitude 
 	return initialFare + meteredFare
 }
 
-func calculateDiscountedFare(ctx context.Context, tx *sqlx.Tx, userID string, ride *Ride, pickupLatitude, pickupLongitude, destLatitude, destLongitude int) (int, error) {
+func calculateDiscountedFare(ctx context.Context, tx executableGet, userID string, ride *Ride, pickupLatitude, pickupLongitude, destLatitude, destLongitude int) (int, error) {
 	var coupon Coupon
 	discount := 0
 	if ride != nil {

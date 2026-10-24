@@ -32,7 +32,7 @@ func internalGetMatching(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 空き椅子 = 受付中で、割り当て済みのライドの通知（6状態）をすべて椅子に送り終えている椅子。
+	// 空き椅子 = 受付中で、前のライドの状態遷移が6つとも記録されている椅子。
 	// 椅子には前のライドが終わってから次を割り当てるので、未完了になり得るのは最後に割り当てたライド
 	// （updated_at が最新のもの）だけ。それだけを調べる。
 	// 最新の位置・ライドは MAX + GROUP BY で取る。相関サブクエリの ORDER BY ... LIMIT 1 だと
@@ -57,7 +57,7 @@ WHERE chairs.is_active = TRUE
                   FROM rides
                   WHERE rides.chair_id = chairs.id
                     AND rides.updated_at = latest_ride.updated_at
-                    AND (SELECT COUNT(chair_sent_at) FROM ride_statuses WHERE ride_id = rides.id) < 6)
+                    AND (SELECT COUNT(cs.id) FROM ride_statuses cs WHERE cs.ride_id = rides.id) < 6)
 `); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -90,6 +90,8 @@ WHERE chairs.is_active = TRUE
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		// マッチしたので、ユーザー（椅子が決まったこと）と椅子（割り当てられたこと）に伝える
+		publishRideChange(ride.UserID, chairs[best].ID)
 		chairs = append(chairs[:best], chairs[best+1:]...)
 	}
 
