@@ -864,84 +864,67 @@ func appGetNearbyChairs(w http.ResponseWriter, r *http.Request) {
 
 	coordinate := Coordinate{Latitude: lat, Longitude: lon}
 
-	tx, err := db.Beginx()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+	// 受付中で、位置を送信済みで、ライドが完了している（または一度もない）椅子を1クエリで取る。
+	// 椅子には前のライドが終わってから次を割り当てるので、未完了になり得るのは最後に割り当てたライド
+	// （updated_at が最新のもの）だけ。COMPLETED は最後の状態なので、それがあれば完了している。
+	// 最新の位置・ライドは MAX + GROUP BY で取る（相関サブクエリの ORDER BY ... LIMIT 1 は履歴を全件読むため）
+	type availableChair struct {
+		ID        string `db:"id"`
+		Name      string `db:"name"`
+		Model     string `db:"model"`
+		Latitude  int    `db:"latitude"`
+		Longitude int    `db:"longitude"`
 	}
-	defer tx.Rollback()
-
-	chairs := []Chair{}
-	err = tx.SelectContext(
-		ctx,
-		&chairs,
-		`SELECT * FROM chairs`,
-	)
+	chairs := []availableChair{}
+	err = db.SelectContext(ctx, &chairs, `
+SELECT chairs.id, chairs.name, chairs.model, chair_locations.latitude, chair_locations.longitude
+FROM chairs
+       INNER JOIN (SELECT chair_id, MAX(created_at) AS created_at
+                   FROM chair_locations
+                   GROUP BY chair_id) latest_location ON latest_location.chair_id = chairs.id
+       INNER JOIN chair_locations ON chair_locations.chair_id = latest_location.chair_id
+                                 AND chair_locations.created_at = latest_location.created_at
+       LEFT JOIN (SELECT chair_id, MAX(updated_at) AS updated_at
+                  FROM rides
+                  WHERE chair_id IS NOT NULL
+                  GROUP BY chair_id) latest_ride ON latest_ride.chair_id = chairs.id
+WHERE chairs.is_active = TRUE
+  AND NOT EXISTS (SELECT 1
+                  FROM rides
+                  WHERE rides.chair_id = chairs.id
+                    AND rides.updated_at = latest_ride.updated_at
+                    AND NOT EXISTS (SELECT 1 FROM ride_statuses WHERE ride_id = rides.id AND status = 'COMPLETED'))
+ORDER BY chairs.id
+`)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 
 	nearbyChairs := []appGetNearbyChairsResponseChair{}
+	seen := make(map[string]bool, len(chairs))
 	for _, chair := range chairs {
-		if !chair.IsActive {
+		// 同じ時刻の位置が2件あると椅子が2行になるので、1つにまとめる
+		if seen[chair.ID] {
 			continue
 		}
+		seen[chair.ID] = true
 
-		rides := []*Ride{}
-		if err := tx.SelectContext(ctx, &rides, `SELECT * FROM rides WHERE chair_id = ? ORDER BY created_at DESC`, chair.ID); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-
-		skip := false
-		for _, ride := range rides {
-			// 過去にライドが存在し、かつ、それが完了していない場合はスキップ
-			status, err := getLatestRideStatus(ctx, tx, ride.ID)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, err)
-				return
-			}
-			if status != "COMPLETED" {
-				skip = true
-				break
-			}
-		}
-		if skip {
-			continue
-		}
-
-		// 最新の位置情報を取得
-		chairLocation := &ChairLocation{}
-		err = tx.GetContext(
-			ctx,
-			chairLocation,
-			`SELECT * FROM chair_locations WHERE chair_id = ? ORDER BY created_at DESC LIMIT 1`,
-			chair.ID,
-		)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				continue
-			}
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-
-		if calculateDistance(coordinate.Latitude, coordinate.Longitude, chairLocation.Latitude, chairLocation.Longitude) <= distance {
+		if calculateDistance(coordinate.Latitude, coordinate.Longitude, chair.Latitude, chair.Longitude) <= distance {
 			nearbyChairs = append(nearbyChairs, appGetNearbyChairsResponseChair{
 				ID:    chair.ID,
 				Name:  chair.Name,
 				Model: chair.Model,
 				CurrentCoordinate: Coordinate{
-					Latitude:  chairLocation.Latitude,
-					Longitude: chairLocation.Longitude,
+					Latitude:  chair.Latitude,
+					Longitude: chair.Longitude,
 				},
 			})
 		}
 	}
 
 	retrievedAt := &time.Time{}
-	err = tx.GetContext(
+	err = db.GetContext(
 		ctx,
 		retrievedAt,
 		`SELECT CURRENT_TIMESTAMP(6)`,
