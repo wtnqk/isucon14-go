@@ -10,9 +10,12 @@
 # ホストは ssh の接続先。"-" を含まない名前には DEPLOY_HOST_PREFIX を付ける（app1 -> isucon14-app1）。
 #
 # 役割（HOST:ROLE。省略時は app）:
-#   app    webapp/go を送ってビルドし、APP_SERVICE を再起動する
-#   db     webapp/sql を送るだけ。WEB_SERVICE を再起動する（nginx など。空なら再起動しない）
-#   nginx  DOMAIN の nginx 設定を送って nginx を再起動する
+#   app    webapp/go を送ってビルドし、isuride-go と isuride-payment_mock を再起動する
+#   db     webapp/sql を送るだけ（初期化は POST /api/initialize）。DB_WEB_SERVICE があれば再起動
+#   nginx  リポジトリの nginx 設定を検証してから反映し、nginx と isuride-matcher を再起動する
+#
+# 役割で使わないサービスは、その台で無効化して止める（matcher は nginx の台だけ、
+# payment_mock は app の台だけ）。止める対象は ROLE_SERVICES_UNUSED_* で変えられる。
 #
 # 3台構成の例:
 #   scripts/deploy.sh app1:app app3:db app2:nginx
@@ -41,12 +44,41 @@ HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:8080/api/app/notification}"
 DOMAIN="${DOMAIN:-xiv.isucon.net}"
 DB_WEB_SERVICE="${DB_WEB_SERVICE:-}"
 
+# 役割ごとに「有効にして再起動するサービス」と「無効にして止めるサービス」を決める。
+# 分割構成では台ごとに役割が違うので、放置すると無関係な台でサービスが動き続ける。
+# 例: matcher は nginx の /api/internal/ (allow 127.0.0.1) を叩くので nginx の台だけ、
+#     payment_mock はアプリから参照されるので app の台だけ。
+ROLE_SERVICES_APP="isuride-go.service isuride-payment_mock.service"
+ROLE_SERVICES_DB="mysql.service"
+ROLE_SERVICES_NGINX="nginx.service isuride-matcher.service"
+ROLE_SERVICES_UNUSED_APP="isuride-matcher.service nginx.service"
+ROLE_SERVICES_UNUSED_DB="isuride-go.service isuride-matcher.service isuride-payment_mock.service nginx.service"
+ROLE_SERVICES_UNUSED_NGINX="isuride-go.service isuride-payment_mock.service"
+
 # 役割ごとの設定
 deploy_paths_for() {
     case "$1" in
         app) echo "webapp/go webapp/sql" ;;   # sql は POST /api/initialize が app 台で exec するため要る
         db) echo "webapp/sql" ;;
         nginx) echo "" ;;                     # 設定ファイルは別途送る
+        *) return 1 ;;
+    esac
+}
+
+# 役割で使うサービスと、その役割では使わないサービスを取り出す
+services_for() {
+    case "$1" in
+        app) echo "$ROLE_SERVICES_APP" ;;
+        db) echo "$ROLE_SERVICES_DB" ;;
+        nginx) echo "$ROLE_SERVICES_NGINX" ;;
+        *) return 1 ;;
+    esac
+}
+unused_services_for() {
+    case "$1" in
+        app) echo "$ROLE_SERVICES_UNUSED_APP" ;;
+        db) echo "$ROLE_SERVICES_UNUSED_DB" ;;
+        nginx) echo "$ROLE_SERVICES_UNUSED_NGINX" ;;
         *) return 1 ;;
     esac
 }
@@ -176,9 +208,37 @@ REMOTE
     remote_bash "$host" \
         "$REMOTE_STAGE" "$REMOTE_ROOT" "$REMOTE_GO" "$APP_BIN" "$APP_SERVICE" "$HEALTH_URL" \
         "$short" "$subject" "$deployer" "$paths" "$REMOTE_OVERLAY" "$role" \
-        "$DOMAIN" "$DB_WEB_SERVICE" <<'REMOTE'
+        "$DOMAIN" "$DB_WEB_SERVICE" "$(services_for "$role")" "$(unused_services_for "$role")" <<'REMOTE'
 set -euo pipefail
-stage=$1 root=$2 go=$3 bin=$4 app_svc=$5 health=$6 short=$7 subject=$8 deployer=$9 paths=${10} overlay=${11} role=${12} domain=${13} db_web_svc=${14}
+stage=$1 root=$2 go=$3 bin=$4 app_svc=$5 health=$6 short=$7 subject=$8 deployer=$9 paths=${10} overlay=${11} role=${12} domain=${13} db_web_svc=${14} role_svcs=${15} unused_svcs=${16}
+
+# 役割で使わないサービスは無効化して止める。分割構成で無関係な台が動き続けるのを防ぐ。
+# ユニットが無い台では何もしない（db 台に nginx が無い等）。
+disable_unused() {
+    for svc in $unused_svcs; do
+        if ! systemctl list-unit-files --no-legend "$svc" 2>/dev/null | grep -q .; then
+            continue
+        fi
+        if [ "$(systemctl is-enabled "$svc" 2>/dev/null || true)" = "disabled" ] &&
+           [ "$(systemctl is-active "$svc" 2>/dev/null || true)" = "inactive" ]; then
+            continue
+        fi
+        sudo systemctl disable --now "$svc" >/dev/null 2>&1 || true
+        echo "   停止: $svc（$role の役割ではない）"
+    done
+}
+
+# 役割で使うサービスを有効化する（起動はそれぞれの反映処理の後で行う）
+enable_role_services() {
+    for svc in $role_svcs; do
+        if systemctl list-unit-files --no-legend "$svc" 2>/dev/null | grep -q .; then
+            if [ "$(systemctl is-enabled "$svc" 2>/dev/null || true)" != "enabled" ]; then
+                sudo systemctl enable "$svc" >/dev/null 2>&1 || true
+                echo "   有効化: $svc"
+            fi
+        fi
+    done
+}
 
 # rsync --delete の宛先を間違えると取り返しがつかないので、最初に確かめる
 [ -n "$root" ] && [ -d "$root" ] || { echo "!! REMOTE_ROOT が不正: '$root'" >&2; exit 1; }
@@ -233,7 +293,10 @@ if [ "$role" = "nginx" ]; then
         exit 1
     fi
     sudo rm -rf "$checkdir"
+    disable_unused
+    enable_role_services
     sudo systemctl reload nginx
+    sudo systemctl restart isuride-matcher.service 2>/dev/null || true
     printf '%s %s\n%s by %s\nrole: %s\n' "$short" "$subject" "$(date '+%F %T')" "$deployer" "$role" > "$root/REVISION"
     echo "   OK: nginx 設定を反映 ($domain)"
     exit 0
@@ -262,6 +325,8 @@ done
 printf '%s %s\n%s by %s\nrole: %s\noverlay: %s\n' "$short" "$subject" "$(date '+%F %T')" "$deployer" "$role" "${overlay_files:-なし}" > "$root/REVISION"
 
 if [ "$role" = "db" ]; then
+    disable_unused
+    enable_role_services
     if [ -n "$db_web_svc" ]; then
         sudo systemctl restart "$db_web_svc"
         echo "   OK: $root に sql を反映、$db_web_svc を再起動（初期化は POST /api/initialize で行う）"
@@ -271,7 +336,13 @@ if [ "$role" = "db" ]; then
     exit 0
 fi
 
-sudo systemctl restart "$app_svc"
+disable_unused
+enable_role_services
+# 役割で使うサービス（app なら payment_mock も）をまとめて再起動する
+for svc in $role_svcs; do
+    systemctl list-unit-files --no-legend "$svc" 2>/dev/null | grep -q . || continue
+    sudo systemctl restart "$svc"
+done
 sleep 1
 if ! systemctl is-active --quiet "$app_svc"; then
     echo "!! $app_svc が起動していません" >&2
