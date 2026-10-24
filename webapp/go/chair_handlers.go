@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -192,81 +193,101 @@ func chairGetNotification(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	chair := ctx.Value("chair").(*Chair)
 
-	tx, err := db.Beginx()
+	if notificationSSE {
+		streamNotifications(w, r,
+			func(ctx context.Context) (bool, error) { return chairHasUnsentNotification(ctx, chair.ID) },
+			func(ctx context.Context) (*chairGetNotificationResponseData, bool, error) {
+				return buildChairNotification(ctx, chair)
+			},
+		)
+		return
+	}
+
+	data, _, err := buildChairNotification(ctx, chair)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	defer tx.Rollback()
-	ride := &Ride{}
-	yetSentRideStatus := RideStatus{}
-	status := ""
+	writeJSON(w, http.StatusOK, &chairGetNotificationResponse{
+		Data:         data,
+		RetryAfterMs: 300,
+	})
+}
 
+// chairHasUnsentNotification は、椅子の最新ライドに、椅子へ未送信のステータスがあるかを返す
+func chairHasUnsentNotification(ctx context.Context, chairID string) (bool, error) {
+	var exists bool
+	err := db.GetContext(ctx, &exists, `
+SELECT EXISTS (SELECT 1
+               FROM ride_statuses
+               WHERE ride_id = (SELECT id FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1)
+                 AND chair_sent_at IS NULL)
+`, chairID)
+	return exists, err
+}
+
+// buildChairNotification は椅子への通知を1件作る。
+// 未送信のステータスがあれば古いものを1件送信済みにして consumed=true を返す。ライドが無ければ nil を返す
+func buildChairNotification(ctx context.Context, chair *Chair) (data *chairGetNotificationResponseData, consumed bool, err error) {
+	tx, err := db.Beginx()
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.Rollback()
+
+	ride := &Ride{}
 	if err := tx.GetContext(ctx, ride, `SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC LIMIT 1`, chair.ID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			writeJSON(w, http.StatusOK, &chairGetNotificationResponse{
-				RetryAfterMs: 300,
-			})
-			return
+			return nil, false, nil
 		}
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return nil, false, err
 	}
 
+	yetSentRideStatus := RideStatus{}
+	status := ""
 	if err := tx.GetContext(ctx, &yetSentRideStatus, `SELECT * FROM ride_statuses WHERE ride_id = ? AND chair_sent_at IS NULL ORDER BY created_at ASC LIMIT 1`, ride.ID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			status, err = getLatestRideStatus(ctx, tx, ride.ID)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, err)
-				return
-			}
-		} else {
-			writeError(w, http.StatusInternalServerError, err)
-			return
+		if !errors.Is(err, sql.ErrNoRows) {
+			return nil, false, err
+		}
+		status, err = getLatestRideStatus(ctx, tx, ride.ID)
+		if err != nil {
+			return nil, false, err
 		}
 	} else {
 		status = yetSentRideStatus.Status
 	}
 
 	user := &User{}
-	err = tx.GetContext(ctx, user, "SELECT * FROM users WHERE id = ? FOR SHARE", ride.UserID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+	if err := tx.GetContext(ctx, user, "SELECT * FROM users WHERE id = ? FOR SHARE", ride.UserID); err != nil {
+		return nil, false, err
 	}
 
 	if yetSentRideStatus.ID != "" {
-		_, err := tx.ExecContext(ctx, `UPDATE ride_statuses SET chair_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?`, yetSentRideStatus.ID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
+		if _, err := tx.ExecContext(ctx, `UPDATE ride_statuses SET chair_sent_at = CURRENT_TIMESTAMP(6) WHERE id = ?`, yetSentRideStatus.ID); err != nil {
+			return nil, false, err
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return nil, false, err
 	}
 
-	writeJSON(w, http.StatusOK, &chairGetNotificationResponse{
-		Data: &chairGetNotificationResponseData{
-			RideID: ride.ID,
-			User: simpleUser{
-				ID:   user.ID,
-				Name: fmt.Sprintf("%s %s", user.Firstname, user.Lastname),
-			},
-			PickupCoordinate: Coordinate{
-				Latitude:  ride.PickupLatitude,
-				Longitude: ride.PickupLongitude,
-			},
-			DestinationCoordinate: Coordinate{
-				Latitude:  ride.DestinationLatitude,
-				Longitude: ride.DestinationLongitude,
-			},
-			Status: status,
+	return &chairGetNotificationResponseData{
+		RideID: ride.ID,
+		User: simpleUser{
+			ID:   user.ID,
+			Name: fmt.Sprintf("%s %s", user.Firstname, user.Lastname),
 		},
-		RetryAfterMs: 300,
-	})
+		PickupCoordinate: Coordinate{
+			Latitude:  ride.PickupLatitude,
+			Longitude: ride.PickupLongitude,
+		},
+		DestinationCoordinate: Coordinate{
+			Latitude:  ride.DestinationLatitude,
+			Longitude: ride.DestinationLongitude,
+		},
+		Status: status,
+	}, yetSentRideStatus.ID != "", nil
 }
 
 type postChairRidesRideIDStatusRequest struct {
