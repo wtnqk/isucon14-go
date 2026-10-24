@@ -46,8 +46,28 @@ type coordinateFlushStats struct {
 	totalTime   time.Duration
 	maxTime     time.Duration
 	maxLag      time.Duration // 書き込んだ座標のうち、受け取ってから書き終わるまでに一番長くかかったもの
+	phases      coordinateWritePhases
 	errors      int
 	lastLogTime time.Time
+}
+
+// 1 回の書き込みのうち、どの文に時間がかかっているかを見るため、段階ごとの時間を測る
+type coordinateWritePhases struct {
+	begin    time.Duration // コネクションの取得とトランザクションの開始
+	lock     time.Duration // chair_total_distances の読み込み（FOR UPDATE）
+	rides    time.Duration // chair_states と rides の読み込み
+	upsert   time.Duration // chair_total_distances の upsert
+	arrivals time.Duration // 到着の記録
+	commit   time.Duration
+}
+
+func (p *coordinateWritePhases) add(o coordinateWritePhases) {
+	p.begin += o.begin
+	p.lock += o.lock
+	p.rides += o.rides
+	p.upsert += o.upsert
+	p.arrivals += o.arrivals
+	p.commit += o.commit
 }
 
 var (
@@ -55,7 +75,7 @@ var (
 	coordinateStats   coordinateFlushStats
 )
 
-func recordCoordinateFlush(batch []pendingCoordinate, arrivals int, elapsed time.Duration, err error) {
+func recordCoordinateFlush(batch []pendingCoordinate, arrivals int, phases coordinateWritePhases, elapsed time.Duration, err error) {
 	now := time.Now()
 	coordinateStatsMu.Lock()
 	defer coordinateStatsMu.Unlock()
@@ -74,6 +94,7 @@ func recordCoordinateFlush(batch []pendingCoordinate, arrivals int, elapsed time
 		}
 	}
 	st.maxBatch = max(st.maxBatch, len(batch))
+	st.phases.add(phases)
 	st.totalTime += elapsed
 	st.maxTime = max(st.maxTime, elapsed)
 	if now.Sub(st.lastLogTime) < coordinateStatsInterval {
@@ -82,13 +103,20 @@ func recordCoordinateFlush(batch []pendingCoordinate, arrivals int, elapsed time
 	pendingCoordinatesMu.Lock()
 	pending := len(pendingCoordinates)
 	pendingCoordinatesMu.Unlock()
+	avgMs := func(d time.Duration) int64 { return d.Milliseconds() / int64(st.flushes) }
 	slog.Info("coordinate flush",
 		"flushes", st.flushes,
 		"points", st.points,
 		"arrivals", st.arrivals,
 		"max_batch", st.maxBatch,
-		"avg_ms", st.totalTime.Milliseconds()/int64(st.flushes),
+		"avg_ms", avgMs(st.totalTime),
 		"max_ms", st.maxTime.Milliseconds(),
+		"avg_begin_ms", avgMs(st.phases.begin),
+		"avg_lock_ms", avgMs(st.phases.lock),
+		"avg_rides_ms", avgMs(st.phases.rides),
+		"avg_upsert_ms", avgMs(st.phases.upsert),
+		"avg_arrivals_ms", avgMs(st.phases.arrivals),
+		"avg_commit_ms", avgMs(st.phases.commit),
 		"max_lag_ms", st.maxLag.Milliseconds(),
 		"pending", pending,
 		"errors", st.errors)
@@ -137,8 +165,8 @@ func flushCoordinates(ctx context.Context) error {
 	}
 
 	start := time.Now()
-	arrivals, err := writeCoordinates(ctx, batch)
-	recordCoordinateFlush(batch, arrivals, time.Since(start), err)
+	arrivals, phases, err := writeCoordinates(ctx, batch)
+	recordCoordinateFlush(batch, arrivals, phases, time.Since(start), err)
 	if err != nil {
 		// 書けなかった分は、後から届いた分より前に戻して次回に回す（椅子ごとの順番を保つため）
 		pendingCoordinatesMu.Lock()
@@ -149,11 +177,11 @@ func flushCoordinates(ctx context.Context) error {
 	return nil
 }
 
-// writeCoordinates は、届いた座標を 1 つのトランザクションで書き込み、記録した到着の件数を返す。
+// writeCoordinates は、届いた座標を 1 つのトランザクションで書き込み、記録した到着の件数と段階ごとの時間を返す。
 // 件数にかかわらず文の数は一定にする（1 回が遅くなると次の回に溜まる件数が増え、さらに遅くなるため）。
 //   - 移動距離の合計：前回の座標から、届いた順に座標の差を足す。最新の座標と、最後に受け取った時刻も更新する
 //   - 到着の判定：乗車地点（ENROUTE のとき）・目的地（CARRYING のとき）に着いたら PICKUP・ARRIVED を記録する
-func writeCoordinates(ctx context.Context, batch []pendingCoordinate) (int, error) {
+func writeCoordinates(ctx context.Context, batch []pendingCoordinate) (int, coordinateWritePhases, error) {
 	// 椅子ごとに、届いた順に並べる
 	chairIDs := []string{}
 	byChair := map[string][]pendingCoordinate{}
@@ -164,11 +192,21 @@ func writeCoordinates(ctx context.Context, batch []pendingCoordinate) (int, erro
 		byChair[c.ChairID] = append(byChair[c.ChairID], c)
 	}
 
+	var phases coordinateWritePhases
+	phaseStart := time.Now()
+	// 前の段階の終わりから今までの時間を d に記録する
+	endPhase := func(d *time.Duration) {
+		now := time.Now()
+		*d = now.Sub(phaseStart)
+		phaseStart = now
+	}
+
 	tx, err := db.Beginx()
 	if err != nil {
-		return 0, err
+		return 0, phases, err
 	}
 	defer tx.Rollback()
+	endPhase(&phases.begin)
 
 	// 前回の座標と移動距離の合計
 	type distanceRow struct {
@@ -179,12 +217,13 @@ func writeCoordinates(ctx context.Context, batch []pendingCoordinate) (int, erro
 	}
 	query, args, err := sqlx.In(`SELECT chair_id, total_distance, last_latitude, last_longitude FROM chair_total_distances WHERE chair_id IN (?) FOR UPDATE`, chairIDs)
 	if err != nil {
-		return 0, err
+		return 0, phases, err
 	}
 	distances := []distanceRow{}
 	if err := tx.SelectContext(ctx, &distances, query, args...); err != nil {
-		return 0, err
+		return 0, phases, err
 	}
+	endPhase(&phases.lock)
 	prevByChair := map[string]distanceRow{}
 	for _, d := range distances {
 		prevByChair[d.ChairID] = d
@@ -212,12 +251,13 @@ FROM chair_states
        INNER JOIN rides ON rides.id = chair_states.ride_id
 WHERE chair_states.chair_id IN (?)`, chairIDs)
 	if err != nil {
-		return 0, err
+		return 0, phases, err
 	}
 	rides := []rideRow{}
 	if err := tx.SelectContext(ctx, &rides, query, args...); err != nil {
-		return 0, err
+		return 0, phases, err
 	}
+	endPhase(&phases.rides)
 	rideByChair := map[string]rideRow{}
 	for _, r := range rides {
 		rideByChair[r.ChairID] = r
@@ -259,6 +299,9 @@ WHERE chair_states.chair_id IN (?)`, chairIDs)
 		distanceArgs = append(distanceArgs, chairID, total, last.RecordedAt, lastLat, lastLon)
 	}
 
+	// ここまでの Go 側の計算は DB の時間ではないので、どの段階にも含めない
+	phaseStart = time.Now()
+
 	// recorded_at と total_distance_updated_at は同じ時刻にそろえる（ベンチがこの2つを突き合わせる）
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO chair_total_distances (chair_id, total_distance, total_distance_updated_at, last_latitude, last_longitude)
@@ -268,8 +311,9 @@ ON DUPLICATE KEY UPDATE total_distance            = VALUES(total_distance),
                         last_latitude             = VALUES(last_latitude),
                         last_longitude            = VALUES(last_longitude)`,
 		distanceArgs...); err != nil {
-		return 0, err
+		return 0, phases, err
 	}
+	endPhase(&phases.upsert)
 
 	if len(arrivals) > 0 {
 		statusArgs := make([]any, 0, len(arrivals)*3)
@@ -283,16 +327,20 @@ ON DUPLICATE KEY UPDATE total_distance            = VALUES(total_distance),
 		if _, err := tx.ExecContext(ctx,
 			"INSERT INTO ride_statuses (id, ride_id, status) VALUES (?, ?, ?)"+strings.Repeat(", (?, ?, ?)", len(arrivals)-1),
 			statusArgs...); err != nil {
-			return 0, err
+			return 0, phases, err
 		}
 		// updateChairRideStatus と同じく、今のライドが到着したライドのときだけ更新する
 		if _, err := tx.ExecContext(ctx,
 			"UPDATE chair_states SET ride_status = CASE chair_id"+strings.Repeat(" WHEN ? THEN ?", len(arrivals))+
 				" END WHERE (chair_id, ride_id) IN ((?, ?)"+strings.Repeat(", (?, ?)", len(arrivals)-1)+")",
 			append(caseArgs, inArgs...)...); err != nil {
-			return 0, err
+			return 0, phases, err
 		}
 	}
 
-	return len(arrivals), tx.Commit()
+	endPhase(&phases.arrivals)
+
+	err = tx.Commit()
+	endPhase(&phases.commit)
+	return len(arrivals), phases, err
 }
