@@ -29,6 +29,7 @@
     group: "root"
     mode: "0644"
   with_items:
+    - etc/nginx/nginx.conf
     - etc/nginx/sites-available/isuride.conf
     - etc/nginx/sites-available/isuride-php.conf
 
