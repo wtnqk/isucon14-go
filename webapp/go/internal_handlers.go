@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/jmoiron/sqlx"
 )
@@ -24,6 +26,7 @@ func internalGetMatching(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	matchingMu.Lock()
 	defer matchingMu.Unlock()
+	start := time.Now()
 
 	rides := []Ride{}
 	if err := db.SelectContext(ctx, &rides, `SELECT * FROM rides WHERE chair_id IS NULL ORDER BY created_at`); err != nil {
@@ -31,6 +34,7 @@ func internalGetMatching(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(rides) == 0 {
+		slog.Info("matching", "waiting", 0, "elapsed_ms", time.Since(start).Milliseconds())
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -56,6 +60,8 @@ WHERE chairs.is_active = TRUE
 		return
 	}
 
+	// 調査用: 1 回のマッチングで何件割り当てたかをログに出す
+	candidates, assigned, skipped := len(chairs), 0, 0
 	for _, ride := range rides {
 		if len(chairs) == 0 {
 			break
@@ -70,34 +76,42 @@ WHERE chairs.is_active = TRUE
 			}
 		}
 
-		if err := assignRide(r, ride.ID, chairs[best].ID); err != nil {
+		ok, err := assignRide(r, ride.ID, chairs[best].ID)
+		if err != nil {
+			slog.Info("matching", "waiting", len(rides), "candidates", candidates, "assigned", assigned, "skipped", skipped, "elapsed_ms", time.Since(start).Milliseconds(), "err", err)
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		if ok {
+			assigned++
+		} else {
+			skipped++
+		}
 		chairs = append(chairs[:best], chairs[best+1:]...)
 	}
+	slog.Info("matching", "waiting", len(rides), "candidates", candidates, "assigned", assigned, "skipped", skipped, "elapsed_ms", time.Since(start).Milliseconds())
 
 	w.WriteHeader(http.StatusNoContent)
 }
 
 // assignRide はライドに椅子を割り当て、椅子の今のライド（chair_states）を更新する。
-// ライドが既に割り当て済みなら何もしない
-func assignRide(r *http.Request, rideID, chairID string) error {
+// ライドが既に割り当て済みなら何もせず false を返す
+func assignRide(r *http.Request, rideID, chairID string) (bool, error) {
 	ctx := r.Context()
 	tx, err := db.Beginx()
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer tx.Rollback()
 
 	result, err := tx.ExecContext(ctx, "UPDATE rides SET chair_id = ? WHERE id = ? AND chair_id IS NULL", chairID, rideID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if n, err := result.RowsAffected(); err != nil {
-		return err
+		return false, err
 	} else if n == 0 {
-		return nil
+		return false, nil
 	}
 
 	// 割り当てた時点のライドの状態は MATCHING（ライド作成時に記録される）
@@ -108,10 +122,10 @@ ON DUPLICATE KEY UPDATE ride_id        = VALUES(ride_id),
                         ride_status    = VALUES(ride_status),
                         completed_sent = VALUES(completed_sent)`,
 		chairID, rideID); err != nil {
-		return err
+		return false, err
 	}
 
-	return tx.Commit()
+	return true, tx.Commit()
 }
 
 // updateChairRideStatus は、椅子に割り当て済みのライドのステータスを記録したときに、
