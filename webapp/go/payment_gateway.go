@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 )
@@ -16,82 +17,56 @@ type paymentGatewayPostPaymentRequest struct {
 	Amount int `json:"amount"`
 }
 
-type paymentGatewayGetPaymentsResponseOne struct {
-	Amount int    `json:"amount"`
-	Status string `json:"status"`
-}
+// 決済の再送の上限と間隔。決済サーバーは混んでいると一定の確率で失敗するが、
+// 失敗するかは毎回ランダムなので、待っても成功しやすくはならない。短い間隔ですぐ送り直す
+const (
+	paymentMaxAttempts   = 10
+	paymentRetryInterval = 10 * time.Millisecond
+)
 
-func requestPaymentGatewayPostPayment(ctx context.Context, paymentGatewayURL string, token string, param *paymentGatewayPostPaymentRequest, retrieveRidesOrderByCreatedAtAsc func() ([]Ride, error)) error {
+// requestPaymentGatewayPostPayment は決済を依頼し、成功するまで送り直す。
+// idempotencyKey（ライド ID）を Idempotency-Key ヘッダで送るので、失敗の応答が返っても
+// 実は決済済みだった場合に、送り直しで二重に支払われることはない。
+// そのため、失敗のたびに決済一覧を取得して成否を確かめる必要はない
+func requestPaymentGatewayPostPayment(ctx context.Context, paymentGatewayURL string, token string, idempotencyKey string, param *paymentGatewayPostPaymentRequest) error {
 	b, err := json.Marshal(param)
 	if err != nil {
 		return err
 	}
 
-	// 失敗したらとりあえずリトライ
-	// FIXME: 社内決済マイクロサービスのインフラに異常が発生していて、同時にたくさんリクエストすると変なことになる可能性あり
-	retry := 0
-	for {
-		err := func() error {
-			req, err := http.NewRequestWithContext(ctx, http.MethodPost, paymentGatewayURL+"/payments", bytes.NewBuffer(b))
-			if err != nil {
-				return err
-			}
-			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("Authorization", "Bearer "+token)
-
-			res, err := http.DefaultClient.Do(req)
-			if err != nil {
-				return err
-			}
-			defer res.Body.Close()
-
-			if res.StatusCode != http.StatusNoContent {
-				// エラーが返ってきても成功している場合があるので、社内決済マイクロサービスに問い合わせ
-				getReq, err := http.NewRequestWithContext(ctx, http.MethodGet, paymentGatewayURL+"/payments", bytes.NewBuffer([]byte{}))
-				if err != nil {
-					return err
-				}
-				getReq.Header.Set("Authorization", "Bearer "+token)
-
-				getRes, err := http.DefaultClient.Do(getReq)
-				if err != nil {
-					return err
-				}
-				defer res.Body.Close()
-
-				// GET /payments は障害と関係なく200が返るので、200以外は回復不能なエラーとする
-				if getRes.StatusCode != http.StatusOK {
-					return fmt.Errorf("[GET /payments] unexpected status code (%d)", getRes.StatusCode)
-				}
-				var payments []paymentGatewayGetPaymentsResponseOne
-				if err := json.NewDecoder(getRes.Body).Decode(&payments); err != nil {
-					return err
-				}
-
-				rides, err := retrieveRidesOrderByCreatedAtAsc()
-				if err != nil {
-					return err
-				}
-
-				if len(rides) != len(payments) {
-					return fmt.Errorf("unexpected number of payments: %d != %d. %w", len(rides), len(payments), erroredUpstream)
-				}
-
-				return nil
-			}
-			return nil
-		}()
-		if err != nil {
-			if retry < 5 {
-				retry++
-				time.Sleep(100 * time.Millisecond)
-				continue
-			} else {
-				return err
-			}
+	var lastErr error
+	for attempt := 0; attempt < paymentMaxAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(paymentRetryInterval)
 		}
-		break
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, paymentGatewayURL+"/payments", bytes.NewReader(b))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Idempotency-Key", idempotencyKey)
+
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+
+		switch {
+		case res.StatusCode == http.StatusNoContent:
+			return nil
+		case res.StatusCode == http.StatusConflict || res.StatusCode >= 500:
+			// 409 は同じキーの決済が処理中。5xx は混雑による失敗。どちらも送り直す
+			lastErr = fmt.Errorf("[POST /payments] unexpected status code (%d)", res.StatusCode)
+		default:
+			// 400 や 422 は送り直しても成功しない
+			return fmt.Errorf("[POST /payments] unexpected status code (%d)", res.StatusCode)
+		}
 	}
 
-	return nil
+	return fmt.Errorf("%w: %v", erroredUpstream, lastErr)
 }
