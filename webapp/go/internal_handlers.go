@@ -33,25 +33,43 @@ func internalGetMatching(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 空き椅子 = 受付中で、割り当て済みのライドの通知（6状態）をすべて椅子に送り終えている椅子。
+	// 椅子には前のライドが終わってから次を割り当てるので、未完了になり得るのは最後に割り当てたライド
+	// （updated_at が最新のもの）だけ。それだけを調べる。
+	// 最新の位置・ライドは MAX + GROUP BY で取る。相関サブクエリの ORDER BY ... LIMIT 1 だと
+	// LIMIT が効かず、椅子ごとに履歴を全件読んでソートしてしまうため。
 	// 位置が未送信の椅子は距離が分からないので、次回以降に回す
-	chairs := []matchingChair{}
-	if err := db.SelectContext(ctx, &chairs, `
+	rows := []matchingChair{}
+	if err := db.SelectContext(ctx, &rows, `
 SELECT chairs.id, chair_models.speed, chair_locations.latitude, chair_locations.longitude
 FROM chairs
        INNER JOIN chair_models ON chair_models.name = chairs.model
-       INNER JOIN chair_locations ON chair_locations.id = (SELECT id
-                                                           FROM chair_locations
-                                                           WHERE chair_id = chairs.id
-                                                           ORDER BY created_at DESC
-                                                           LIMIT 1)
+       INNER JOIN (SELECT chair_id, MAX(created_at) AS created_at
+                   FROM chair_locations
+                   GROUP BY chair_id) latest_location ON latest_location.chair_id = chairs.id
+       INNER JOIN chair_locations ON chair_locations.chair_id = latest_location.chair_id
+                                 AND chair_locations.created_at = latest_location.created_at
+       LEFT JOIN (SELECT chair_id, MAX(updated_at) AS updated_at
+                  FROM rides
+                  WHERE chair_id IS NOT NULL
+                  GROUP BY chair_id) latest_ride ON latest_ride.chair_id = chairs.id
 WHERE chairs.is_active = TRUE
   AND NOT EXISTS (SELECT 1
                   FROM rides
                   WHERE rides.chair_id = chairs.id
+                    AND rides.updated_at = latest_ride.updated_at
                     AND (SELECT COUNT(chair_sent_at) FROM ride_statuses WHERE ride_id = rides.id) < 6)
 `); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	// 同じ時刻の位置が2件あると椅子が2行になり、二重に割り当ててしまうので1行にまとめる
+	chairs := make([]matchingChair, 0, len(rows))
+	seen := make(map[string]bool, len(rows))
+	for _, chair := range rows {
+		if !seen[chair.ID] {
+			seen[chair.ID] = true
+			chairs = append(chairs, chair)
+		}
 	}
 
 	for _, ride := range rides {
