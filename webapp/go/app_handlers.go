@@ -192,75 +192,51 @@ func appGetRides(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	user := ctx.Value("user").(*User)
 
-	tx, err := db.Beginx()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	defer tx.Rollback()
-
-	rides := []Ride{}
-	if err := tx.SelectContext(
-		ctx,
-		&rides,
-		`SELECT * FROM rides WHERE user_id = ? ORDER BY created_at DESC`,
-		user.ID,
-	); err != nil {
+	// 完了したライドを、椅子・オーナー・使ったクーポンの割引額と一緒に1クエリで取る。
+	// 割引後の運賃は calculateDiscountedFare（ライドに紐づくクーポンを使う場合）と同じ計算をする
+	rides := []struct {
+		Ride
+		ChairName  string `db:"chair_name"`
+		ChairModel string `db:"chair_model"`
+		OwnerName  string `db:"owner_name"`
+		Discount   int    `db:"discount"`
+	}{}
+	if err := db.SelectContext(ctx, &rides, `
+SELECT rides.*,
+       chairs.name                  AS chair_name,
+       chairs.model                 AS chair_model,
+       owners.name                  AS owner_name,
+       IFNULL(coupons.discount, 0)  AS discount
+FROM rides
+       INNER JOIN chairs ON chairs.id = rides.chair_id
+       INNER JOIN owners ON owners.id = chairs.owner_id
+       LEFT JOIN coupons ON coupons.used_by = rides.id
+WHERE rides.user_id = ?
+  AND EXISTS (SELECT 1 FROM ride_statuses WHERE ride_id = rides.id AND status = 'COMPLETED')
+ORDER BY rides.created_at DESC
+`, user.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 
 	items := []getAppRidesResponseItem{}
 	for _, ride := range rides {
-		status, err := getLatestRideStatus(ctx, tx, ride.ID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		if status != "COMPLETED" {
-			continue
-		}
-
-		fare, err := calculateDiscountedFare(ctx, tx, user.ID, &ride, ride.PickupLatitude, ride.PickupLongitude, ride.DestinationLatitude, ride.DestinationLongitude)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-
-		item := getAppRidesResponseItem{
+		meteredFare := farePerDistance * calculateDistance(ride.PickupLatitude, ride.PickupLongitude, ride.DestinationLatitude, ride.DestinationLongitude)
+		items = append(items, getAppRidesResponseItem{
 			ID:                    ride.ID,
 			PickupCoordinate:      Coordinate{Latitude: ride.PickupLatitude, Longitude: ride.PickupLongitude},
 			DestinationCoordinate: Coordinate{Latitude: ride.DestinationLatitude, Longitude: ride.DestinationLongitude},
-			Fare:                  fare,
-			Evaluation:            *ride.Evaluation,
-			RequestedAt:           ride.CreatedAt.UnixMilli(),
-			CompletedAt:           ride.UpdatedAt.UnixMilli(),
-		}
-
-		item.Chair = getAppRidesResponseItemChair{}
-
-		chair := &Chair{}
-		if err := tx.GetContext(ctx, chair, `SELECT * FROM chairs WHERE id = ?`, ride.ChairID); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		item.Chair.ID = chair.ID
-		item.Chair.Name = chair.Name
-		item.Chair.Model = chair.Model
-
-		owner := &Owner{}
-		if err := tx.GetContext(ctx, owner, `SELECT * FROM owners WHERE id = ?`, chair.OwnerID); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		item.Chair.Owner = owner.Name
-
-		items = append(items, item)
-	}
-
-	if err := tx.Commit(); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+			Chair: getAppRidesResponseItemChair{
+				ID:    ride.ChairID.String,
+				Owner: ride.OwnerName,
+				Name:  ride.ChairName,
+				Model: ride.ChairModel,
+			},
+			Fare:        initialFare + max(meteredFare-ride.Discount, 0),
+			Evaluation:  *ride.Evaluation,
+			RequestedAt: ride.CreatedAt.UnixMilli(),
+			CompletedAt: ride.UpdatedAt.UnixMilli(),
+		})
 	}
 
 	writeJSON(w, http.StatusOK, &getAppRidesResponse{
@@ -313,22 +289,17 @@ func appPostRides(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	rides := []Ride{}
-	if err := tx.SelectContext(ctx, &rides, `SELECT * FROM rides WHERE user_id = ?`, user.ID); err != nil {
+	// 完了していないライドの数を1クエリで数える。COMPLETED は最後の状態なので、
+	// 「最新のステータスが COMPLETED でない」は「COMPLETED のステータスがない」と同じ
+	continuingRideCount := 0
+	if err := tx.GetContext(ctx, &continuingRideCount, `
+SELECT COUNT(*)
+FROM rides
+WHERE user_id = ?
+  AND NOT EXISTS (SELECT 1 FROM ride_statuses WHERE ride_id = rides.id AND status = 'COMPLETED')
+`, user.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
-	}
-
-	continuingRideCount := 0
-	for _, ride := range rides {
-		status, err := getLatestRideStatus(ctx, tx, ride.ID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		if status != "COMPLETED" {
-			continuingRideCount++
-		}
 	}
 
 	if continuingRideCount > 0 {
