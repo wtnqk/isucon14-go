@@ -54,7 +54,6 @@ type coordinateFlushStats struct {
 // 1 回の書き込みのうち、どの文に時間がかかっているかを見るため、段階ごとの時間を測る
 type coordinateWritePhases struct {
 	begin    time.Duration // コネクションの取得とトランザクションの開始
-	lock     time.Duration // chair_total_distances の読み込み（FOR UPDATE）
 	rides    time.Duration // chair_states と rides の読み込み
 	upsert   time.Duration // chair_total_distances の upsert
 	arrivals time.Duration // 到着の記録
@@ -63,7 +62,6 @@ type coordinateWritePhases struct {
 
 func (p *coordinateWritePhases) add(o coordinateWritePhases) {
 	p.begin += o.begin
-	p.lock += o.lock
 	p.rides += o.rides
 	p.upsert += o.upsert
 	p.arrivals += o.arrivals
@@ -112,7 +110,6 @@ func recordCoordinateFlush(batch []pendingCoordinate, arrivals int, phases coord
 		"avg_ms", avgMs(st.totalTime),
 		"max_ms", st.maxTime.Milliseconds(),
 		"avg_begin_ms", avgMs(st.phases.begin),
-		"avg_lock_ms", avgMs(st.phases.lock),
 		"avg_rides_ms", avgMs(st.phases.rides),
 		"avg_upsert_ms", avgMs(st.phases.upsert),
 		"avg_arrivals_ms", avgMs(st.phases.arrivals),
@@ -179,7 +176,8 @@ func flushCoordinates(ctx context.Context) error {
 
 // writeCoordinates は、届いた座標を 1 つのトランザクションで書き込み、記録した到着の件数と段階ごとの時間を返す。
 // 件数にかかわらず文の数は一定にする（1 回が遅くなると次の回に溜まる件数が増え、さらに遅くなるため）。
-//   - 移動距離の合計：前回の座標から、届いた順に座標の差を足す。最新の座標と、最後に受け取った時刻も更新する
+//   - 移動距離の合計：前回の座標から、届いた順に座標の差を足す。最新の座標と、最後に受け取った時刻も更新する。
+//     前回の座標は読み込まず、upsert の中で DB に計算させる（読み込みとロック待ちの分、DB との往復を減らすため）
 //   - 到着の判定：乗車地点（ENROUTE のとき）・目的地（CARRYING のとき）に着いたら PICKUP・ARRIVED を記録する
 func writeCoordinates(ctx context.Context, batch []pendingCoordinate) (int, coordinateWritePhases, error) {
 	// 椅子ごとに、届いた順に並べる
@@ -208,27 +206,6 @@ func writeCoordinates(ctx context.Context, batch []pendingCoordinate) (int, coor
 	defer tx.Rollback()
 	endPhase(&phases.begin)
 
-	// 前回の座標と移動距離の合計
-	type distanceRow struct {
-		ChairID       string `db:"chair_id"`
-		TotalDistance int    `db:"total_distance"`
-		LastLatitude  int    `db:"last_latitude"`
-		LastLongitude int    `db:"last_longitude"`
-	}
-	query, args, err := sqlx.In(`SELECT chair_id, total_distance, last_latitude, last_longitude FROM chair_total_distances WHERE chair_id IN (?) FOR UPDATE`, chairIDs)
-	if err != nil {
-		return 0, phases, err
-	}
-	distances := []distanceRow{}
-	if err := tx.SelectContext(ctx, &distances, query, args...); err != nil {
-		return 0, phases, err
-	}
-	endPhase(&phases.lock)
-	prevByChair := map[string]distanceRow{}
-	for _, d := range distances {
-		prevByChair[d.ChairID] = d
-	}
-
 	// 椅子の今のライドと、その最新ステータス
 	type rideRow struct {
 		ChairID              string `db:"chair_id"`
@@ -239,7 +216,7 @@ func writeCoordinates(ctx context.Context, batch []pendingCoordinate) (int, coor
 		DestinationLatitude  int    `db:"destination_latitude"`
 		DestinationLongitude int    `db:"destination_longitude"`
 	}
-	query, args, err = sqlx.In(`
+	query, args, err := sqlx.In(`
 SELECT chair_states.chair_id,
        chair_states.ride_status,
        rides.id AS ride_id,
@@ -269,20 +246,14 @@ WHERE chair_states.chair_id IN (?)`, chairIDs)
 		Status  string
 	}
 	arrivals := []arrival{}
-	distanceArgs := make([]any, 0, len(chairIDs)*5)
+	distanceRows := 0
+	distanceArgs := make([]any, 0, len(chairIDs)*2*5)
 	for _, chairID := range chairIDs {
-		prev, hasPrev := prevByChair[chairID]
-		total, lastLat, lastLon := prev.TotalDistance, prev.LastLatitude, prev.LastLongitude
 		ride, hasRide := rideByChair[chairID]
 		status := ride.RideStatus
 
 		points := byChair[chairID]
 		for _, p := range points {
-			if hasPrev {
-				total += abs(p.Latitude-lastLat) + abs(p.Longitude-lastLon)
-			}
-			lastLat, lastLon, hasPrev = p.Latitude, p.Longitude, true
-
 			if !hasRide {
 				continue
 			}
@@ -295,18 +266,37 @@ WHERE chair_states.chair_id IN (?)`, chairIDs)
 				arrivals = append(arrivals, arrival{ChairID: chairID, RideID: ride.RideID, Status: status})
 			}
 		}
-		last := points[len(points)-1]
-		distanceArgs = append(distanceArgs, chairID, total, last.RecordedAt, lastLat, lastLon)
+
+		// 下の upsert は、1 行ごとに「前回の座標からその行の座標までの差」と「その行の加算分」を足し、その行の座標を最新にする。
+		// 椅子ごとに最初の点と最後の点の 2 行だけ送り、途中の点の分は最後の点の加算分に含める
+		// （最初の点から最後の点までの道のり − 2 点間の直線の差。道のりは直線の差以上なので負にならない）
+		first, last := points[0], points[len(points)-1]
+		distanceArgs = append(distanceArgs, chairID, 0, first.RecordedAt, first.Latitude, first.Longitude)
+		distanceRows++
+		if len(points) > 1 {
+			path := 0
+			for i := 1; i < len(points); i++ {
+				path += abs(points[i].Latitude-points[i-1].Latitude) + abs(points[i].Longitude-points[i-1].Longitude)
+			}
+			direct := abs(last.Latitude-first.Latitude) + abs(last.Longitude-first.Longitude)
+			distanceArgs = append(distanceArgs, chairID, path-direct, last.RecordedAt, last.Latitude, last.Longitude)
+			distanceRows++
+		}
 	}
 
 	// ここまでの Go 側の計算は DB の時間ではないので、どの段階にも含めない
 	phaseStart = time.Now()
 
-	// recorded_at と total_distance_updated_at は同じ時刻にそろえる（ベンチがこの2つを突き合わせる）
+	// recorded_at と total_distance_updated_at は同じ時刻にそろえる（ベンチがこの2つを突き合わせる）。
+	// 複数行の upsert は 1 行ずつ順に適用されるので、同じ椅子の 2 行目は 1 行目で更新した座標との差を足す。
+	// 初めての椅子は 1 行目が INSERT になり、移動距離は 0 から始まる。
+	// 代入は左から順に評価されるので、total_distance は last_latitude・last_longitude を更新する前に書く
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO chair_total_distances (chair_id, total_distance, total_distance_updated_at, last_latitude, last_longitude)
-VALUES (?, ?, ?, ?, ?)`+strings.Repeat(", (?, ?, ?, ?, ?)", len(chairIDs)-1)+`
-ON DUPLICATE KEY UPDATE total_distance            = VALUES(total_distance),
+VALUES (?, ?, ?, ?, ?)`+strings.Repeat(", (?, ?, ?, ?, ?)", distanceRows-1)+`
+ON DUPLICATE KEY UPDATE total_distance            = total_distance + VALUES(total_distance)
+                                                    + ABS(VALUES(last_latitude) - last_latitude)
+                                                    + ABS(VALUES(last_longitude) - last_longitude),
                         total_distance_updated_at = VALUES(total_distance_updated_at),
                         last_latitude             = VALUES(last_latitude),
                         last_longitude            = VALUES(last_longitude)`,
