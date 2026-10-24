@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/oklog/ulid/v2"
 )
@@ -111,21 +112,9 @@ func chairPostCoordinate(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	chairLocationID := ulid.Make().String()
-	if _, err := tx.ExecContext(
-		ctx,
-		`INSERT INTO chair_locations (id, chair_id, latitude, longitude) VALUES (?, ?, ?, ?)`,
-		chairLocationID, chair.ID, req.Latitude, req.Longitude,
-	); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	location := &ChairLocation{}
-	if err := tx.GetContext(ctx, location, `SELECT * FROM chair_locations WHERE id = ?`, chairLocationID); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
+	// 位置の履歴（chair_locations）はどこからも読まないので保存せず、最新の座標と移動距離の合計だけを更新する。
+	// recorded_at と total_distance_updated_at は同じ時刻にそろえる（ベンチがこの2つを突き合わせる）
+	recordedAt := time.Now().Truncate(time.Microsecond)
 
 	// 移動距離の合計に、前回の座標からの距離を足す。total_distance は前回の座標を使うので最初に更新する
 	if _, err := tx.ExecContext(
@@ -136,7 +125,7 @@ ON DUPLICATE KEY UPDATE total_distance            = total_distance + ABS(VALUES(
                         total_distance_updated_at = VALUES(total_distance_updated_at),
                         last_latitude             = VALUES(last_latitude),
                         last_longitude            = VALUES(last_longitude)`,
-		chair.ID, location.CreatedAt, location.Latitude, location.Longitude,
+		chair.ID, recordedAt, req.Latitude, req.Longitude,
 	); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -177,7 +166,7 @@ ON DUPLICATE KEY UPDATE total_distance            = total_distance + ABS(VALUES(
 	}
 
 	writeJSON(w, http.StatusOK, &chairPostCoordinateResponse{
-		RecordedAt: location.CreatedAt.UnixMilli(),
+		RecordedAt: recordedAt.UnixMilli(),
 	})
 }
 
